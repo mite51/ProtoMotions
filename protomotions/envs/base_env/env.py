@@ -1391,10 +1391,14 @@ class BaseEnv:
         """Get task identifier for logging and checkpointing.
 
         Returns:
-            String identifier (motion file name or 'null')
+            String identifier (motion file basename or 'null')
         """
         if self.motion_manager is not None:
-            return self.motion_lib.motion_file.split("/")[-1]
+            # Normalize backslashes so Windows-style paths (e.g.
+            # "C:\\Git\\foo\\motions.pt") also yield just the filename.
+            # Otherwise the full path leaks into checkpoint filenames and
+            # creates invalid nested directories like "env_C:\\Git\\...ckpt".
+            return self.motion_lib.motion_file.replace("\\", "/").split("/")[-1]
         return "null"
 
     @staticmethod
@@ -1424,7 +1428,9 @@ class BaseEnv:
             return None
 
         try:
-            evaluated_motions = motion_file.split("/")[-1]
+            # Normalize backslashes so Windows-style paths still produce a
+            # clean basename (mirrors BaseEnv.get_task_id).
+            evaluated_motions = motion_file.replace("\\", "/").split("/")[-1]
             checkpoint_path = Path(save_dir) / f"env_{evaluated_motions}.ckpt"
 
             if not checkpoint_path.exists():

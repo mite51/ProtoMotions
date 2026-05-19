@@ -679,13 +679,21 @@ def main():
 
     from protomotions.utils.fabric_config import FabricConfig
     from lightning.fabric import Fabric
+    import sys  # noqa: E402
 
-    fabric_config = FabricConfig(
+    fabric_kwargs = dict(
         devices=args.ngpu,
         num_nodes=args.nodes,
         loggers=loggers,
         callbacks=callbacks,
     )
+    # On Windows, NCCL is unavailable, so fall back to a single-device strategy.
+    # On other platforms, let FabricConfig use its default (DDPStrategy).
+    if sys.platform == "win32":
+        from lightning.fabric.strategies import SingleDeviceStrategy
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        fabric_kwargs["strategy"] = SingleDeviceStrategy(device=device)
+    fabric_config = FabricConfig(**fabric_kwargs)
     print(asdict(fabric_config))
     fabric: Fabric = Fabric(**asdict(fabric_config))
     fabric.launch()
