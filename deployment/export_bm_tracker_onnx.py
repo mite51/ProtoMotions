@@ -62,23 +62,44 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 
 
 class _MockState:
-    """Mock for CurrentStateView."""
+    """Mock for CurrentStateView.
+
+    Mirrors the field surface defined in
+    ``protomotions/envs/context_views.py::CurrentStateView`` so that any obs
+    binding (``current.<field>``) resolves during ONNX tracing.
+    """
 
     def __init__(self, num_envs: int, num_dofs: int, num_bodies: int, anchor_idx: int):
         import torch
         import torch.nn.functional as F
 
-        # Actor obs fields
-        self.dof_pos = torch.randn(num_envs, num_dofs)
-        self.dof_vel = torch.randn(num_envs, num_dofs)
-        self.anchor_rot = F.normalize(torch.randn(num_envs, 4), dim=-1)
-        self.anchor_pos = torch.randn(num_envs, 3)
-        self.root_local_ang_vel = torch.randn(num_envs, 3)
-        # Critic obs fields
-        self.rigid_body_pos     = torch.randn(num_envs, num_bodies, 3)
-        self.rigid_body_rot     = F.normalize(torch.randn(num_envs, num_bodies, 4), dim=-1)
-        self.rigid_body_vel     = torch.randn(num_envs, num_bodies, 3)
-        self.rigid_body_ang_vel = torch.randn(num_envs, num_bodies, 3)
+        # Per-body state
+        self.rigid_body_pos      = torch.randn(num_envs, num_bodies, 3)
+        self.rigid_body_rot      = F.normalize(torch.randn(num_envs, num_bodies, 4), dim=-1)
+        self.rigid_body_vel      = torch.randn(num_envs, num_bodies, 3)
+        self.rigid_body_ang_vel  = torch.randn(num_envs, num_bodies, 3)
+        self.rigid_body_contacts = torch.zeros(num_envs, num_bodies, dtype=torch.bool)
+
+        # DOF state
+        self.dof_pos    = torch.randn(num_envs, num_dofs)
+        self.dof_vel    = torch.randn(num_envs, num_dofs)
+        self.dof_forces = torch.zeros(num_envs, num_dofs)
+        self.anchor_idx = anchor_idx
+
+        # Root properties
+        self.root_pos            = torch.randn(num_envs, 3)
+        self.root_rot            = F.normalize(torch.randn(num_envs, 4), dim=-1)
+        self.root_vel            = torch.randn(num_envs, 3)
+        self.root_ang_vel        = torch.randn(num_envs, 3)
+        self.root_height         = torch.randn(num_envs)
+        self.root_local_ang_vel  = torch.randn(num_envs, 3)
+
+        # Anchor properties
+        self.anchor_pos            = torch.randn(num_envs, 3)
+        self.anchor_rot            = F.normalize(torch.randn(num_envs, 4), dim=-1)
+        self.anchor_vel            = torch.randn(num_envs, 3)
+        self.anchor_ang_vel        = torch.randn(num_envs, 3)
+        self.anchor_local_ang_vel  = torch.randn(num_envs, 3)
 
 
 class _MockMimic:
@@ -117,12 +138,62 @@ class _MockMimic:
 
 
 class _MockHistorical:
-    """Mock for HistoricalContext (action history)."""
+    """Mock for HistoricalView (state + action history).
 
-    def __init__(self, num_envs: int, history_steps: int, num_dofs: int):
+    Mirrors ``protomotions/envs/context_views.py::HistoricalView``.  All
+    historical observations bind through ``EnvContext.historical.<field>``,
+    so any missing attribute here will raise during obs tracing.
+    """
+
+    def __init__(
+        self,
+        num_envs: int,
+        history_steps: int,
+        num_dofs: int,
+        num_bodies: int,
+    ):
         import torch
+        import torch.nn.functional as F
 
+        # Per-body historical state
+        self.rigid_body_pos     = torch.randn(num_envs, history_steps, num_bodies, 3)
+        self.rigid_body_rot     = F.normalize(
+            torch.randn(num_envs, history_steps, num_bodies, 4), dim=-1
+        )
+        self.rigid_body_vel     = torch.randn(num_envs, history_steps, num_bodies, 3)
+        self.rigid_body_ang_vel = torch.randn(num_envs, history_steps, num_bodies, 3)
+
+        # DOF history
+        self.dof_pos = torch.randn(num_envs, history_steps, num_dofs)
+        self.dof_vel = torch.randn(num_envs, history_steps, num_dofs)
+
+        # Action history.  ``previous_actions_factory(processed=False)`` (the
+        # default) binds to ``historical.actions``; ``processed=True`` binds to
+        # ``historical.processed_actions``.  Provide both.
+        self.actions           = torch.randn(num_envs, history_steps, num_dofs)
         self.processed_actions = torch.randn(num_envs, history_steps, num_dofs)
+
+        # Misc historical scalars
+        self.ground_heights = torch.zeros(num_envs, history_steps)
+        self.body_contacts  = torch.zeros(
+            num_envs, history_steps, num_bodies, dtype=torch.bool
+        )
+
+        # Root properties
+        self.root_pos           = torch.randn(num_envs, history_steps, 3)
+        self.root_rot           = F.normalize(
+            torch.randn(num_envs, history_steps, 4), dim=-1
+        )
+        self.root_ang_vel       = torch.randn(num_envs, history_steps, 3)
+        self.root_local_ang_vel = torch.randn(num_envs, history_steps, 3)
+
+        # Anchor properties
+        self.anchor_pos     = torch.randn(num_envs, history_steps, 3)
+        self.anchor_rot     = F.normalize(
+            torch.randn(num_envs, history_steps, 4), dim=-1
+        )
+        self.anchor_vel     = torch.randn(num_envs, history_steps, 3)
+        self.anchor_ang_vel = torch.randn(num_envs, history_steps, 3)
 
 
 class MockContext:
@@ -141,7 +212,9 @@ class MockContext:
 
         self.current = _MockState(num_envs, num_dofs, num_bodies, anchor_idx)
         self.mimic   = _MockMimic(num_envs, num_future_steps, num_dofs, num_bodies)
-        self.historical = _MockHistorical(num_envs, history_steps, num_dofs)
+        self.historical = _MockHistorical(
+            num_envs, history_steps, num_dofs, num_bodies
+        )
         # body_contacts: used by max_coords_obs observe_contacts
         self.body_contacts  = torch.zeros(num_envs, num_bodies, dtype=torch.bool)
         # ground_heights: used by max_coords_obs root_height_obs
