@@ -79,9 +79,16 @@ app = typer.Typer(pretty_exceptions_enable=False)
 
 # ---- Bone mapping --------------------------------------------------------- #
 
-# Default mapping: SMPL MJCF bone name -> source FBX bone name.
-# Covers Mixamo, Maya HIK, Kubold animset and most "standard humanoid" rigs.
-DEFAULT_BONE_MAPPING: Dict[str, str] = {
+# A "rig profile" maps each SMPL MJCF bone name to the corresponding source
+# bone in a particular humanoid naming convention. Different DCC tools/asset
+# packs use *similar but conflicting* names (e.g. "LeftLeg" means upper leg in
+# Unity-humanoid rigs but the knee in Mixamo), so we register profiles and
+# auto-pick the best match per FBX.
+RigProfile = Dict[str, str]
+
+
+# Mixamo / Maya HIK / Kubold animset (2 spine joints).
+RIG_PROFILE_MIXAMO: RigProfile = {
     "Pelvis": "Hips",
     "L_Hip": "LeftUpLeg",
     "L_Knee": "LeftLeg",
@@ -92,8 +99,7 @@ DEFAULT_BONE_MAPPING: Dict[str, str] = {
     "R_Ankle": "RightFoot",
     "R_Toe": "RightToeBase",
     "Torso": "Spine",
-    # SMPL "Spine" (middle vertebra) has no direct counterpart on a 2-spine
-    # source rig, so we let it inherit the parent (Torso).
+    # No middle-spine counterpart on a 2-spine source rig; left unmapped.
     "Chest": "Spine1",
     "Neck": "Neck",
     "Head": "Head",
@@ -101,7 +107,6 @@ DEFAULT_BONE_MAPPING: Dict[str, str] = {
     "L_Shoulder": "LeftArm",
     "L_Elbow": "LeftForeArm",
     "L_Wrist": "LeftHand",
-    # SMPL "L_Hand" is a terminal joint past the wrist — keep at rest.
     "R_Thorax": "RightShoulder",
     "R_Shoulder": "RightArm",
     "R_Elbow": "RightForeArm",
@@ -109,21 +114,93 @@ DEFAULT_BONE_MAPPING: Dict[str, str] = {
 }
 
 
-# Common Mixamo-style fallback names with explicit "mixamorig:" prefix.
+# Kimodo rigs: "Spine1, Spine2, Chest" spine (3 joints), 2 neck joints,
+# legs use Leg/Shin/Foot rather than UpLeg/Leg/Foot.
+RIG_PROFILE_KIMODO: RigProfile = {
+    "Pelvis": "Hips",
+    "L_Hip": "LeftLeg",
+    "L_Knee": "LeftShin",
+    "L_Ankle": "LeftFoot",
+    "L_Toe": "LeftToeBase",
+    "R_Hip": "RightLeg",
+    "R_Knee": "RightShin",
+    "R_Ankle": "RightFoot",
+    "R_Toe": "RightToeBase",
+    "Torso": "Spine1",
+    "Spine": "Spine2",
+    "Chest": "Chest",
+    "Neck": "Neck1",
+    "Head": "Head",
+    "L_Thorax": "LeftShoulder",
+    "L_Shoulder": "LeftArm",
+    "L_Elbow": "LeftForeArm",
+    "L_Wrist": "LeftHand",
+    "R_Thorax": "RightShoulder",
+    "R_Shoulder": "RightArm",
+    "R_Elbow": "RightForeArm",
+    "R_Wrist": "RightHand",
+}
+
+
+RIG_PROFILES: Dict[str, RigProfile] = {
+    "mixamo": RIG_PROFILE_MIXAMO,
+    "kimodo": RIG_PROFILE_KIMODO,
+}
+
+
+# Common Mixamo-style fallback name prefixes (e.g. "mixamorig:LeftArm").
 MIXAMO_PREFIX_VARIANTS = ("", "mixamorig:", "mixamorig1:", "mixamorig2:")
 
 
-# ---- Helpers -------------------------------------------------------------- #
+def _profile_score(
+    profile: RigProfile, source_bone_names_set: set
+) -> Tuple[int, RigProfile]:
+    """Return (number of bones resolved, resolved profile with prefix-applied names)."""
+    resolved: RigProfile = {}
+    n = 0
+    for smpl_name, src_name in profile.items():
+        for prefix in MIXAMO_PREFIX_VARIANTS:
+            candidate = prefix + src_name
+            if candidate in source_bone_names_set:
+                resolved[smpl_name] = candidate
+                n += 1
+                break
+    return n, resolved
 
 
-def _resolve_source_bone(source_bone_names, source_name: str) -> Optional[str]:
-    """Return the actual bone name from the rig, trying common Mixamo prefixes."""
+def select_rig_profile(
+    source_bone_names, profile_override: Optional[str] = None
+) -> Tuple[str, RigProfile]:
+    """Auto-detect the best matching rig profile, or honour ``profile_override``.
+
+    Returns ``(profile_name, resolved_mapping)`` where ``resolved_mapping``
+    contains the actual bone names (with prefixes applied) found in the rig.
+    Bones missing from the rig are simply omitted from the resolved mapping.
+    """
     name_set = set(source_bone_names)
-    for prefix in MIXAMO_PREFIX_VARIANTS:
-        candidate = prefix + source_name
-        if candidate in name_set:
-            return candidate
-    return None
+    if profile_override is not None:
+        if profile_override not in RIG_PROFILES:
+            raise typer.BadParameter(
+                f"Unknown rig profile '{profile_override}'. "
+                f"Available: {list(RIG_PROFILES.keys())}"
+            )
+        score, resolved = _profile_score(RIG_PROFILES[profile_override], name_set)
+        return profile_override, resolved
+
+    best_name, best_score, best_resolved = None, -1, {}
+    for name, profile in RIG_PROFILES.items():
+        score, resolved = _profile_score(profile, name_set)
+        if score > best_score:
+            best_name, best_score, best_resolved = name, score, resolved
+    if best_name is None or best_score == 0:
+        raise RuntimeError(
+            "No rig profile matched any bones in this FBX. "
+            f"Source bones (first 20): {list(source_bone_names)[:20]}"
+        )
+    return best_name, best_resolved
+
+
+# ---- Helpers -------------------------------------------------------------- #
 
 
 def _ortho_normalize(R: np.ndarray) -> np.ndarray:
@@ -162,22 +239,26 @@ def _ortho_normalize_batch(R: np.ndarray) -> np.ndarray:
 def _compute_align_rotation(
     source_rest_pos: np.ndarray,
     source_name_to_idx: Dict[str, int],
-    bone_map: Dict[str, str],
+    resolved_mapping: RigProfile,
 ) -> np.ndarray:
     """Compute the 3x3 rotation that maps the source-rig world frame onto
     the SMPL MJCF world frame (X-forward, Y-left, Z-up).
 
-    Uses the rest-pose positions of Hips, Spine1, LeftUpLeg, RightUpLeg.
+    Uses the rest-pose positions of Pelvis, Chest, L_Hip, R_Hip.
+    ``resolved_mapping`` must already have the actual rig-specific bone names
+    (with any prefixes applied) — see :func:`select_rig_profile`.
     """
 
     def _resolve(smpl_name: str) -> int:
-        src = bone_map.get(smpl_name)
+        src = resolved_mapping.get(smpl_name)
         if src is None:
-            raise KeyError(f"No source mapping for SMPL '{smpl_name}'")
-        actual = _resolve_source_bone(list(source_name_to_idx.keys()), src)
-        if actual is None:
+            raise KeyError(
+                f"Resolved rig mapping is missing '{smpl_name}'. "
+                "Cannot compute frame alignment without it."
+            )
+        if src not in source_name_to_idx:
             raise KeyError(f"Source bone '{src}' not found in FBX rig")
-        return source_name_to_idx[actual]
+        return source_name_to_idx[src]
 
     hips = source_rest_pos[_resolve("Pelvis")]
     spine1 = source_rest_pos[_resolve("Chest")]
@@ -228,22 +309,66 @@ def _compute_smpl_rest_world(
 def _build_source_index_map(
     smpl_body_names,
     source_bone_names,
-    bone_map: Dict[str, str],
+    resolved_mapping: RigProfile,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """For each SMPL body, return (source_idx, has_source_flag)."""
+    """For each SMPL body, return (source_idx, has_source_flag).
+
+    ``resolved_mapping`` is the output of :func:`select_rig_profile` and only
+    contains entries whose rig-specific name actually exists in the FBX.
+    """
     name_to_idx = {n: i for i, n in enumerate(source_bone_names)}
     src_idx = np.full(len(smpl_body_names), -1, dtype=np.int64)
     for j, smpl_name in enumerate(smpl_body_names):
-        src_name = bone_map.get(smpl_name)
-        if src_name is None:
+        src_name = resolved_mapping.get(smpl_name)
+        if src_name is None or src_name not in name_to_idx:
             continue
-        actual = _resolve_source_bone(source_bone_names, src_name)
-        if actual is None:
-            print(f"  [warn] source bone '{src_name}' not found, leaving '{smpl_name}' free")
-            continue
-        src_idx[j] = name_to_idx[actual]
+        src_idx[j] = name_to_idx[src_name]
     has_source = src_idx >= 0
     return src_idx, has_source
+
+
+# ---- Height-anchoring strategies ----------------------------------------- #
+
+# Why this is its own concept (vs. just using ``RobotState.fix_height``):
+# ``fix_height`` shifts so that the **global** minimum body z over all frames
+# equals ``foot_offset``. That works for animations where the character is
+# always upright (every frame's lowest body == feet on the floor). For
+# animations like ``getup_facedown``/``getup_faceup`` the character lies on
+# the ground for many frames, so the global minimum is body parts touching
+# the floor *during the lying phase*, not the feet during the standing phase.
+# That makes the standing feet end up several centimetres above the floor
+# after the global shift.
+HEIGHT_MODES = ("global", "last_frame", "first_frame", "per_frame", "disable")
+
+
+def _apply_height_anchor(motion, mode: str, foot_offset: float) -> None:
+    """In-place vertical anchoring of ``motion`` according to ``mode``.
+
+    Modes:
+      * ``global``: classic ``fix_height`` — global min lands at ``foot_offset``.
+      * ``last_frame`` / ``first_frame``: anchor to one frame's lowest body.
+        Ideal for getup/laydown clips that end (or start) in stable standing.
+      * ``per_frame``: each frame's lowest body lands at ``foot_offset`` (only
+        lifts frames below ground, drops by at most 0.02 m).
+      * ``disable``: leave the FK output untouched.
+    """
+    if mode == "disable":
+        return
+    if mode == "global":
+        motion.fix_height(height_offset=foot_offset)
+        return
+    if mode == "per_frame":
+        motion.fix_height_per_frame(height_offset=foot_offset)
+        return
+    if mode in {"last_frame", "first_frame"}:
+        idx = -1 if mode == "last_frame" else 0
+        ref_min = motion.rigid_body_pos[idx, :, 2].min().item()
+        shift_z = float(-ref_min + foot_offset)
+        shift_vec = torch.zeros(3, device=motion.rigid_body_pos.device)
+        shift_vec[2] = shift_z
+        motion.translate(shift_vec)
+        return
+    raise ValueError(f"Unknown height_mode '{mode}'. Choose one of {HEIGHT_MODES}.")
 
 
 # ---- Retargeting core ----------------------------------------------------- #
@@ -353,6 +478,7 @@ def _process_action(
     dtype: torch.dtype,
     foot_offset: float,
     output_dir: Path,
+    height_mode: str = "global",
 ):
     src_world_rot = _ortho_normalize_batch(action["world_rot"])  # strip Blender scale
     src_world_pos = action["world_pos"]  # (T, J, 3)
@@ -424,7 +550,7 @@ def _process_action(
     )
     motion.dof_vel = local_angular_vels.reshape(-1, n_j * 3)
 
-    motion.fix_height(height_offset=foot_offset)
+    _apply_height_anchor(motion, height_mode, foot_offset)
 
     motion.rigid_body_contacts = compute_contact_labels_from_pos_and_vel(
         positions=motion.rigid_body_pos,
@@ -482,6 +608,103 @@ def _ensure_extracted_pkl(
         raise RuntimeError("Blender extraction failed.")
 
 
+def _ensure_rest_pkl(
+    rest_fbx: Path,
+    pkl_path: Path,
+    blender_exe: Optional[str],
+) -> None:
+    """Extract just the rest pose (bind pose) from a separate FBX file."""
+    if pkl_path.exists():
+        print(f"Reusing rest-pose pickle: {pkl_path}")
+        return
+
+    if blender_exe is None:
+        candidate = Path(r"C:\Program Files\Blender Foundation\Blender 4.5\blender.exe")
+        if candidate.is_file():
+            blender_exe = str(candidate)
+        else:
+            blender_exe = shutil.which("blender")
+    if blender_exe is None:
+        raise RuntimeError(
+            "Could not find Blender. Pass --blender-exe with the full path to blender.exe."
+        )
+
+    extractor = _SCRIPT_DIR / "_fbx_extract_blender.py"
+    pkl_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        blender_exe, "--background", "--python", str(extractor), "--",
+        str(rest_fbx), str(pkl_path), "tpose", "--rest-only",
+    ]
+    print("Running (rest-only):", " ".join(f'"{c}"' if " " in c else c for c in cmd))
+    res = subprocess.run(cmd, check=False)
+    if res.returncode != 0 or not pkl_path.exists():
+        raise RuntimeError("Blender rest-pose extraction failed.")
+
+
+def _replace_rest_pose(source_data: dict, rest_data: dict) -> None:
+    """Overlay rest_data's rest pose onto source_data, matching by bone name.
+
+    Bones present in source_data but missing from rest_data keep their
+    original (animation-FBX) rest values.
+    """
+    src_names = source_data["bone_names"]
+    rest_names = rest_data["bone_names"]
+    rest_name_to_idx = {n: i for i, n in enumerate(rest_names)}
+
+    new_pos = source_data["rest_world_pos"].copy()
+    new_rot = source_data["rest_world_rot"].copy()
+    matched, missing = 0, []
+    for j, n in enumerate(src_names):
+        if n in rest_name_to_idx:
+            ri = rest_name_to_idx[n]
+            new_pos[j] = rest_data["rest_world_pos"][ri]
+            new_rot[j] = rest_data["rest_world_rot"][ri]
+            matched += 1
+        else:
+            missing.append(n)
+    source_data["rest_world_pos"] = new_pos
+    source_data["rest_world_rot"] = new_rot
+    print(f"Replaced rest pose: {matched}/{len(src_names)} bones matched from rest FBX.")
+    if missing:
+        print(f"  [warn] bones missing from rest FBX (kept old rest): {missing[:8]}{'…' if len(missing) > 8 else ''}")
+
+
+def _detect_scale(
+    source_rest_pos: np.ndarray,
+    source_name_to_idx: Dict[str, int],
+    resolved_mapping: RigProfile,
+    R_align: np.ndarray,
+    target_hip_height_m: float = 0.95,
+) -> float:
+    """Estimate cm/m scale factor by measuring rest-pose Hip height in MJCF frame.
+
+    After alignment, the rest pose should be upright (hips above ground), so the
+    aligned z-coordinate of the hip joint approximates the human's hip height.
+    """
+    pelvis_name = resolved_mapping.get("Pelvis")
+    if pelvis_name is None or pelvis_name not in source_name_to_idx:
+        return 1.0
+    hips_src = source_rest_pos[source_name_to_idx[pelvis_name]]
+    hips_aligned = R_align @ hips_src
+
+    # Use the foot-rooted form: hip z above the lowest mapped joint.
+    foot_candidates = ["L_Ankle", "R_Ankle", "L_Toe", "R_Toe"]
+    foot_zs = []
+    for sname in foot_candidates:
+        rname = resolved_mapping.get(sname)
+        if rname and rname in source_name_to_idx:
+            foot_aligned = R_align @ source_rest_pos[source_name_to_idx[rname]]
+            foot_zs.append(float(foot_aligned[2]))
+    if foot_zs:
+        height_units = float(hips_aligned[2]) - min(foot_zs)
+    else:
+        height_units = float(hips_aligned[2])
+
+    if height_units < 1e-3:
+        return 1.0
+    return target_hip_height_m / height_units
+
+
 # ---- CLI ------------------------------------------------------------------ #
 
 
@@ -511,7 +734,46 @@ def main(
         "protomotions/data/assets/mjcf/smpl_humanoid.xml",
         help="Path to the SMPL MJCF used for kinematic info.",
     ),
+    rig_profile: Optional[str] = typer.Option(
+        None,
+        help=(
+            "Override rig auto-detection. Available profiles: "
+            f"{', '.join(RIG_PROFILES.keys())}."
+        ),
+    ),
+    rest_fbx: Optional[Path] = typer.Option(
+        None,
+        help=(
+            "Optional separate FBX file whose bind pose (or 'tpose' action) is "
+            "used as the source rest pose. Required for rigs whose animation "
+            "FBX has a non-T-pose bind (e.g. kimodo getup_facedown)."
+        ),
+    ),
+    scale: Optional[float] = typer.Option(
+        None,
+        help=(
+            "Multiplier applied to all source positions (rest + per-frame). "
+            "If omitted, auto-detected from the rest pose (assumes ~0.95 m hip "
+            "height). Pass 0.01 for cm rigs, 1.0 to disable."
+        ),
+    ),
+    height_mode: str = typer.Option(
+        "global",
+        help=(
+            "Vertical anchoring strategy. 'global' (default) pins the global "
+            "minimum body z to foot_offset (best for upright clips like walks). "
+            "'last_frame' / 'first_frame' pin one specific frame's lowest body "
+            "to foot_offset (best for getup/laydown clips that end / start in "
+            "stable standing). 'per_frame' clamps each frame individually. "
+            "'disable' leaves the FK output untouched."
+        ),
+    ),
 ):
+    if height_mode not in HEIGHT_MODES:
+        raise typer.BadParameter(
+            f"Unknown --height-mode '{height_mode}'. "
+            f"Available: {', '.join(HEIGHT_MODES)}"
+        )
     fbx_path = fbx_path.resolve()
     if not fbx_path.is_file():
         raise typer.BadParameter(f"FBX not found: {fbx_path}")
@@ -530,6 +792,16 @@ def main(
         f"{len(source_data['bone_names'])} source bones, "
         f"fps={source_data['source_fps']}"
     )
+
+    if rest_fbx is not None:
+        rest_fbx = rest_fbx.resolve()
+        if not rest_fbx.is_file():
+            raise typer.BadParameter(f"Rest FBX not found: {rest_fbx}")
+        rest_pkl = extracted_pkl.parent / (rest_fbx.stem + "__rest.pkl")
+        _ensure_rest_pkl(rest_fbx, rest_pkl, blender_exe)
+        with open(rest_pkl, "rb") as f:
+            rest_data = pickle.load(f)
+        _replace_rest_pose(source_data, rest_data)
 
     device = torch.device("cpu")
     dtype = torch.float32
@@ -550,21 +822,42 @@ def main(
     # Compute SMPL rest world transforms (used only for height ratio).
     smpl_rest_pos, _ = _compute_smpl_rest_world(kinematic_info, device, dtype)
 
-    # Map source bones.
+    # Auto-detect (or honour override of) the source rig naming convention,
+    # then build a resolved bone map (rig-specific names with prefixes applied).
+    profile_name, resolved_mapping = select_rig_profile(
+        source_data["bone_names"], profile_override=rig_profile
+    )
+    print(
+        f"Rig profile: '{profile_name}' "
+        f"({len(resolved_mapping)}/{len(RIG_PROFILES[profile_name])} bones resolved)"
+    )
+
     name_to_idx = {n: i for i, n in enumerate(source_data["bone_names"])}
     R_align = _compute_align_rotation(
         source_data["rest_world_pos"],
         name_to_idx,
-        DEFAULT_BONE_MAPPING,
+        resolved_mapping,
     )
     print("Source -> MJCF alignment rotation:")
     with np.printoptions(precision=3, suppress=True):
         print(R_align)
 
+    if scale is None:
+        scale = _detect_scale(
+            source_data["rest_world_pos"], name_to_idx, resolved_mapping, R_align
+        )
+        print(f"Auto-detected source scale: {scale:.5f}  (1.0=meters, 0.01=cm)")
+    else:
+        print(f"Using explicit source scale: {scale:.5f}")
+    if abs(scale - 1.0) > 1e-6:
+        source_data["rest_world_pos"] = source_data["rest_world_pos"] * float(scale)
+        for act in source_data["actions"].values():
+            act["world_pos"] = act["world_pos"] * float(scale)
+
     src_idx, _ = _build_source_index_map(
         smpl_body_names,
         source_data["bone_names"],
-        DEFAULT_BONE_MAPPING,
+        resolved_mapping,
     )
     n_mapped = int((src_idx >= 0).sum())
     print(f"Mapped {n_mapped}/{len(smpl_body_names)} SMPL bodies.")
@@ -595,6 +888,7 @@ def main(
                 dtype=dtype,
                 foot_offset=foot_offset,
                 output_dir=output_dir,
+                height_mode=height_mode,
             )
         except Exception as e:  # noqa: BLE001
             import traceback

@@ -48,12 +48,14 @@ def _parse_args():
     if len(rest) < 2:
         raise SystemExit(
             "Usage: blender --background --python _fbx_extract_blender.py -- "
-            "<input.fbx> <output.pkl> [rest_action_substring]"
+            "<input.fbx> <output.pkl> [rest_action_substring] [--rest-only]"
         )
     fbx_path = rest[0]
     out_path = rest[1]
-    rest_substr = rest[2] if len(rest) > 2 else "tpose"
-    return fbx_path, out_path, rest_substr
+    rest_only = "--rest-only" in rest[2:]
+    positional = [a for a in rest[2:] if not a.startswith("--")]
+    rest_substr = positional[0] if positional else "tpose"
+    return fbx_path, out_path, rest_substr, rest_only
 
 
 def _ensure_armature(bpy_module):
@@ -195,7 +197,7 @@ def _clean_action_name(action_name: str) -> str:
 
 
 def main():
-    fbx_path, out_path, rest_substr = _parse_args()
+    fbx_path, out_path, rest_substr, rest_only = _parse_args()
 
     if not os.path.isfile(fbx_path):
         raise SystemExit(f"FBX not found: {fbx_path}")
@@ -262,8 +264,10 @@ def main():
         print("Rest pose sampled from bind pose (no rest action found)")
 
     actions_data = {}
+    if rest_only:
+        print("Rest-only mode: skipping per-action sampling.")
     skip_substrs = ("tpose", "bindpose", "bind_pose", "t_pose", "rest")
-    for action in bpy.data.actions:
+    for action in bpy.data.actions if not rest_only else []:
         lower = action.name.lower()
         if any(s in lower for s in skip_substrs):
             print(f"Skipping rest-style action: {action.name}")
