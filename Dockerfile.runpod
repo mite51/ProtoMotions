@@ -1,0 +1,249 @@
+# syntax=docker/dockerfile:1.6
+#
+# ProtoMotions x IsaacLab — RunPod multi-GPU training image
+# ----------------------------------------------------------
+# Self-contained image for running NVLabs/ProtoMotions IsaacLab training on a
+# single RunPod node with N GPUs. Differs from the in-tree Dockerfile.isaaclab
+# (which depends on NVIDIA's private NGC IsaacLab base) by building IsaacSim +
+# IsaacLab from public sources on top of the public PyTorch NGC base.
+#
+# Build:
+#   docker build -f Dockerfile.runpod -t protomotions-runpod:isaaclab .
+#
+# Build with a fork / branch:
+#   docker build -f Dockerfile.runpod \
+#     --build-arg PROTOMOTIONS_REPO=https://github.com/myuser/ProtoMotions.git \
+#     --build-arg PROTOMOTIONS_BRANCH=my-feature \
+#     -t protomotions-runpod:isaaclab .
+#
+# Layout note (IMPORTANT for RunPod):
+#   RunPod mounts a *persistent volume* at /workspace which SHADOWS anything
+#   baked into /workspace/... by this Dockerfile. So all baked artifacts —
+#   IsaacLab, ProtoMotions, scripts — live under /opt/ instead, which is on
+#   the Container Disk and is never shadowed. /workspace is yours to use
+#   freely for persistent storage (motion files, results, wandb runs, etc.).
+#
+#   /opt/isaaclab        — IsaacLab source (pip-installed editable)
+#   /opt/protomotions    — ProtoMotions source (pip-installed editable)
+#   /opt/entrypoint.sh   — staged entrypoint script (not wired up yet)
+#   /workspace/          — RunPod persistent volume; put data/results here
+#
+
+FROM nvcr.io/nvidia/pytorch:24.03-py3
+
+# ---------------------------------------------------------------------------
+# 1. Environment
+# ---------------------------------------------------------------------------
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    ACCEPT_EULA=Y \
+    PRIVACY_CONSENT=Y \
+    OMNI_KIT_ACCEPT_EULA=YES \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# ---------------------------------------------------------------------------
+# 2. System dependencies
+#    - User-requested: git, wget, curl, unzip, libglu1-mesa, libxt6
+#    - IsaacSim runtime needs: libxrandr2 libxinerama1 libxcursor1 libxi6 libgl1
+#    - Dev headers: needed by egl_probe (transitive: isaaclab_mimic ->
+#      robomimic -> egl_probe) which builds a C++ EGL probe binary at install
+# ---------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        wget \
+        curl \
+        unzip \
+        ca-certificates \
+        libglu1-mesa \
+        libxt6 \
+        libxrandr2 \
+        libxinerama1 \
+        libxcursor1 \
+        libxi6 \
+        libgl1 \
+        libegl1-mesa-dev \
+        libgles2-mesa-dev \
+        libgl1-mesa-dev \
+        openssh-server \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# 3. rclone (binary, used by entrypoint.sh to upload results / checkpoints)
+# ---------------------------------------------------------------------------
+RUN curl -fsSL https://rclone.org/install.sh | bash
+
+# ---------------------------------------------------------------------------
+# 4. Isaac Sim 4.5 (pip wheels from NVIDIA's index, CUDA 12.4 compatible)
+# ---------------------------------------------------------------------------
+RUN pip install --upgrade pip setuptools wheel \
+    && pip install \
+        --extra-index-url https://pypi.nvidia.com \
+        "isaacsim[all,extscache]==4.5.0"
+
+# ---------------------------------------------------------------------------
+# 4b. Replace the broken Python cmake wrapper with a real cmake binary.
+#
+#     The NGC PyTorch image ships a wrapper at /usr/local/bin/cmake that
+#     does `from cmake import cmake`. `pip install cmake` would normally
+#     fix it, BUT when pip builds packages like egl_probe (transitive:
+#     isaaclab_mimic -> robomimic -> egl_probe) it spawns an *isolated*
+#     build environment whose sys.path excludes system site-packages, so
+#     the wrapper still can't import the cmake module from there.
+#
+#     Solution: drop the Python wrapper and use a plain apt-installed
+#     cmake binary at /usr/bin/cmake — it has no Python dependency so
+#     subprocess invocations work in any environment.
+# ---------------------------------------------------------------------------
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake \
+    && rm -f /usr/local/bin/cmake /usr/local/bin/cpack /usr/local/bin/ctest \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# 5. IsaacLab (matching v2.3.x release — supports Isaac Sim 4.5/5.0/5.1)
+#
+# Two non-obvious fixes baked into this step:
+#
+#  1. TERM=xterm — the NGC PyTorch base image sets TERM=ansi+tabs which
+#     isn't in the default terminfo db, making `tput` (used by isaaclab.sh
+#     for colored output) exit non-zero. With the script's `set -e` that
+#     kills the whole install on the very first colored print.
+#
+#  2. Pre-install setuptools<70 + flatdict==4.0.1 with --no-build-isolation
+#     BEFORE running ./isaaclab.sh --install. Reason: `isaaclab` core depends
+#     on flatdict==4.0.1 (latest available, unmaintained since 2018), whose
+#     setup.py does `import pkg_resources`. setuptools 70+ removed
+#     pkg_resources from the default install, so flatdict's wheel build
+#     dies with `ModuleNotFoundError: No module named 'pkg_resources'` in
+#     pip's isolated build env. Downgrading setuptools brings pkg_resources
+#     back, and --no-build-isolation lets flatdict's build use it. Once
+#     flatdict is satisfied, isaaclab.sh's install of core succeeds.
+#
+#     Without this, ./isaaclab.sh --install silently fails on the core
+#     `isaaclab` package and only installs the sub-extensions (isaaclab_rl,
+#     isaaclab_assets, isaaclab_mimic, isaaclab_tasks), which means
+#     `from isaaclab.app import AppLauncher` blows up at runtime.
+#
+#     The explicit `pip install -e source/isaaclab` at the end is defensive:
+#     guarantees core is installed even if isaaclab.sh changes its iteration
+#     logic in future versions. setuptools<70 also matches what
+#     requirements_isaaclab.txt pins (setuptools==69.5.1), so this doesn't
+#     conflict with the ProtoMotions install in the next step.
+# ---------------------------------------------------------------------------
+ARG ISAACLAB_REPO=https://github.com/isaac-sim/IsaacLab.git
+ARG ISAACLAB_BRANCH=v2.3.0
+
+RUN TERM=xterm bash -c "\
+        git clone --depth 1 -b ${ISAACLAB_BRANCH} ${ISAACLAB_REPO} /opt/isaaclab \
+        && cd /opt/isaaclab \
+        && pip install 'setuptools<70' \
+        && pip install --no-build-isolation flatdict==4.0.1 \
+        && ./isaaclab.sh --install \
+        && pip install -e source/isaaclab"
+
+# ---------------------------------------------------------------------------
+# 6. ProtoMotions
+#    Pinned via build args so you can swap fork/branch without editing this file.
+#    Lives at /opt/protomotions (NOT /workspace/protomotions — see layout note
+#    at the top of this file) so the editable install survives RunPod's
+#    persistent-volume mount at /workspace.
+# ---------------------------------------------------------------------------
+ARG PROTOMOTIONS_REPO=https://github.com/NVlabs/ProtoMotions.git
+ARG PROTOMOTIONS_BRANCH=main
+
+# git-lfs is installed inline here (rather than in step 2) so we don't
+# invalidate the slow IsaacSim layer above. Required because assets like
+# protomotions/data/assets/usd/smpl_humanoid.usda are stored in Git LFS;
+# without `git lfs pull` you only get the small pointer stubs and IsaacLab
+# fails to parse them at runtime ("not a valid usda layer").
+RUN apt-get update && apt-get install -y --no-install-recommends git-lfs \
+    && rm -rf /var/lib/apt/lists/* \
+    && git lfs install --system \
+    && git clone -b ${PROTOMOTIONS_BRANCH} ${PROTOMOTIONS_REPO} /opt/protomotions \
+    && cd /opt/protomotions \
+    && git lfs pull
+
+WORKDIR /opt/protomotions
+
+# gdown for Google Drive motion-file downloads in the entrypoint
+RUN pip install gdown \
+    && pip install -e . \
+    && pip install -r requirements_isaaclab.txt
+
+# ---------------------------------------------------------------------------
+# 7. Runtime — RunPod-style sshd bootstrap
+# ---------------------------------------------------------------------------
+# Override the base image's TERM=ansi+tabs at runtime so interactive shells
+# and any terminal-aware tools work cleanly.
+ENV TERM=xterm
+
+# Entrypoint script is staged into the image but NOT wired up as ENTRYPOINT
+# yet — building on Windows produces CRLF line endings that break the
+# shebang on Linux ("No such file or directory"). To enable later, either:
+#   1) Add `* text=auto eol=lf` for *.sh in .gitattributes and re-clone, or
+#   2) Run `dos2unix entrypoint.sh` before COPY, or
+#   3) Build on Linux/WSL.
+# Staged at /opt/ (not /workspace/) so RunPod's volume mount doesn't hide it.
+COPY entrypoint.sh /opt/entrypoint.sh
+
+# sshd configuration: allow root login via key only, never via password.
+# Required so RunPod's "SSH" / "SSH over exposed TCP" tabs work. The
+# pod-side public key is injected at container start via the PUBLIC_KEY
+# env var (set automatically by the RunPod platform from your account).
+RUN mkdir -p /var/run/sshd /root/.ssh \
+    && chmod 700 /root/.ssh \
+    && sed -i \
+        -e 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' \
+        -e 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' \
+        -e 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' \
+        /etc/ssh/sshd_config
+
+# RunPod start script — written via BuildKit heredoc so it always has LF
+# line endings (avoids the Windows CRLF -> "No such file or directory"
+# problem we hit with the original entrypoint.sh).
+#
+# Behavior on every container start:
+#   1) ensure ssh host keys exist
+#   2) inject $PUBLIC_KEY into /root/.ssh/authorized_keys (if provided)
+#   3) exec sshd -D as PID 1 (foreground -> keeps container alive)
+COPY --chmod=755 <<'EOF' /usr/local/bin/start-runpod.sh
+#!/bin/bash
+set -e
+
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+
+if [ -n "${PUBLIC_KEY:-}" ]; then
+    echo "${PUBLIC_KEY}" > /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+fi
+
+# Generate any missing host keys (rsa/ecdsa/ed25519). No-op if they exist.
+ssh-keygen -A 2>/dev/null || true
+
+mkdir -p /var/run/sshd
+
+# `-D` keeps sshd in the foreground (PID 1, keeps container alive).
+# `-e` writes logs to stderr so they show in `docker logs` / RunPod logs.
+exec /usr/sbin/sshd -D -e
+EOF
+
+# Document the SSH port (the actual publish/expose is configured in the
+# RunPod template's "Expose TCP Ports" field; add 22 there).
+EXPOSE 22
+
+# Once SSH'd in (you'll land in /opt/protomotions thanks to WORKDIR above):
+#
+#   # Put motion files on the persistent volume so they survive pod restarts.
+#   mkdir -p /workspace/data/motions
+#   gdown --id 1KL4BRhRFozN9bmsAT68pQo09ssnZkJs3 -O /workspace/data/motions/amass_smpl_train_new.pt
+#   gdown --id 1FfJ7sZruAtezH9Yb8iC9QHwTKpghsLia -O /workspace/data/motions/amass_smpl_train_new.yaml
+#
+#   python protomotions/train_agent.py \
+#     --robot-name smpl --simulator isaaclab \
+#     --experiment-path examples/experiments/mimic/mlp.py \
+#     --experiment-name smpl_amass_flat \
+#     --motion-file /workspace/data/motions/amass_smpl_train_new.pt \
+#     --num-envs 8192 --batch-size 8192 --ngpu $(nvidia-smi -L | wc -l)
+CMD ["/usr/local/bin/start-runpod.sh"]
