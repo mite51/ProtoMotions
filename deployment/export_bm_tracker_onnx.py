@@ -322,32 +322,49 @@ def export_tracker(
             if "history_steps" in sp:
                 history_steps = sp["history_steps"]
 
-    # Resolve MuJoCo-specific timing.
+    # Resolve timing from the *training* simulator config.
+    #
+    # ``control_dt`` (and the substep cadence it implies) is hard-baked
+    # into the policy via the ``historical_actions`` rotation rate and
+    # the ``mimic_future_*`` look-ahead (which is queried at
+    # ``t + i * control_dt`` for ``i in future_step_indices``). The
+    # deploy host *must* tick at the exact cadence the policy was
+    # trained at; baking the wrong cadence into the YAML silently
+    # corrupts the closed loop in a way that looks like a balance-policy
+    # failure (under-impulse per tick, off-by-N-ms future targets) and
+    # is very hard to diagnose downstream.
+    #
+    # Previously this block ran the simulator config through
+    # ``update_simulator_config_for_test(..., new_simulator="mujoco")``
+    # and used MuJoCo's defaults (typically 1 kHz physics, 20
+    # decimation -> 50 Hz control), which is appropriate for an MJCF
+    # deployment target but DOES NOT REFLECT the cadence the policy was
+    # actually trained at. If the trainer ran IsaacLab at 30 Hz the
+    # YAML would still say 50 Hz and any deploy host that trusted it
+    # would diverge. We now read the trainer's own sim.fps / decimation
+    # directly, and warn loudly if they aren't available.
     control_dt = 0.02
     physics_dt = 0.001
     decimation = 20
     pd_target_max_accel = None
     if simulator_config is not None:
-        try:
-            from protomotions.simulator.factory import update_simulator_config_for_test
-            mj_sim_cfg = update_simulator_config_for_test(
-                current_simulator_config=simulator_config,
-                new_simulator="mujoco",
-                robot_config=robot_config,
-            )
-            physics_dt = 1.0 / mj_sim_cfg.sim.fps
-            decimation = mj_sim_cfg.sim.decimation
+        sim_cfg = getattr(simulator_config, "sim", None)
+        _fps = getattr(sim_cfg, "fps", None) if sim_cfg is not None else None
+        _dec = getattr(sim_cfg, "decimation", None) if sim_cfg is not None else None
+        if _fps and _dec:
+            physics_dt = 1.0 / float(_fps)
+            decimation = int(_dec)
             control_dt = physics_dt * decimation
-        except Exception as e:
-            log.warning(f"Could not apply sim2sim conversion: {e}")
-            sim_cfg = getattr(simulator_config, "sim", None)
-            if sim_cfg is not None:
-                _fps = getattr(sim_cfg, "fps", None)
-                _dec = getattr(sim_cfg, "decimation", None)
-                if _fps and _dec:
-                    physics_dt = 1.0 / _fps
-                    decimation = _dec
-                    control_dt = physics_dt * decimation
+        else:
+            log.warning(
+                "simulator_config.sim.fps / .decimation not available; "
+                "falling back to deployment defaults "
+                "(control_dt=%.4fs, physics_dt=%.4fs, decimation=%d). "
+                "The deployed host MUST tick at the policy's training "
+                "cadence — verify these values match training and "
+                "override on the deploy side if not.",
+                control_dt, physics_dt, decimation,
+            )
         _accel = getattr(simulator_config, "pd_target_max_accel", None)
         if _accel is not None:
             pd_target_max_accel = float(_accel)
