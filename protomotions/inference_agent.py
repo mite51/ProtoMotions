@@ -276,7 +276,7 @@ def main():
     # Create fabric config for inference (simplified, single-device)
     import sys  # noqa: E402
     # MuJoCo is CPU-only, so force CPU accelerator
-    accelerator = "cpu" if args.simulator == "mujoco" else "gpu"
+    accelerator = "cpu"# if args.simulator == "mujoco" else "gpu"
     fabric_kwargs = dict(
         accelerator=accelerator,
         devices=1,
@@ -288,7 +288,7 @@ def main():
     # On other platforms, let FabricConfig use its default (DDPStrategy).
     if sys.platform == "win32":
         from lightning.fabric.strategies import SingleDeviceStrategy
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        device = "cpu"# torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         fabric_kwargs["strategy"] = SingleDeviceStrategy(device=device)
     fabric_config = FabricConfig(**fabric_kwargs)
     fabric: Fabric = Fabric(**asdict(fabric_config))
@@ -370,6 +370,22 @@ def main():
 
     agent.setup()
     agent.load(args.checkpoint, load_env=False)
+
+    #########################################################
+    # Enable OmniPVD output stream for recording
+    #########################################################
+    #import carb.settings
+
+    # 1. Get the global Carbonite settings registry
+    #settings = carb.settings.get_settings()
+
+    ## 2. MANDATORY: Define your target recording path first (.ovd files go here)
+    #settings.set("/persistent/physics/omniPvdOvdRecordingDirectory", "/tmp/pvd_recordings/")
+
+    # 3. Enable the OmniPVD output stream
+    #settings.set("/physics/omniPvdOutputEnabled", True)
+    #########################################################
+
 
     try:
         if args.full_eval:
