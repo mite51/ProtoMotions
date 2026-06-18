@@ -327,6 +327,79 @@ def _build_source_index_map(
     return src_idx, has_source
 
 
+# ---- Static-frame trimming ------------------------------------------------ #
+
+# Why this exists:
+# Many FBX exports (Mixamo, Kubold/FightingAnimsetPro, Maya HIK) ship each
+# action with leading/trailing "padding" keyframes that hold the rest pose.
+# Common causes:
+#   * ``bake_anim_force_startend_keying=True`` during FBX export, which always
+#     writes a key at the scene start/end of every action's f-curve — even
+#     when the take's actual motion is shorter than the scene timeline.
+#   * Multi-take FBX where every take's f-curves are padded to a common range.
+#   * Mocap pipelines that record a few seconds of T-pose before/after the
+#     real motion for retargeting reference.
+# Blender's ``action.frame_range`` is computed from the f-curve keyframes, so
+# it includes that padding and we end up with several "no-motion" frames at
+# the head and tail of every clip. We strip them here.
+
+
+def _trim_static_frames(
+    src_world_rot: np.ndarray,
+    src_root_pos: np.ndarray,
+    rot_threshold_rad: float,
+    pos_threshold_m: float,
+    pad_frames: int = 1,
+    min_keep_frames: int = 4,
+) -> Tuple[np.ndarray, np.ndarray, int, int]:
+    """Strip leading/trailing frames where there is no significant body motion.
+
+    Detection: per frame transition we measure (a) the average per-bone
+    rotation delta (Frobenius norm scaled to ~radians for small angles) and
+    (b) the root-position delta. A transition is considered "moving" if
+    *either* exceeds its threshold. We trim everything outside the first/last
+    moving transition (with optional ``pad_frames`` on each side).
+
+    Returns ``(trimmed_world_rot, trimmed_root_pos, first_kept, last_kept)``.
+    Falls back to the original arrays if the clip is shorter than
+    ``min_keep_frames * 2`` or appears static throughout.
+    """
+    T, J = src_world_rot.shape[0], src_world_rot.shape[1]
+    if T < min_keep_frames * 2:
+        return src_world_rot, src_root_pos, 0, T - 1
+
+    # Per-transition rotation magnitude. ||R_t - R_{t-1}||_F ≈ sqrt(2) * theta
+    # for a single bone with rotation angle theta, so dividing by sqrt(2*J)
+    # gives an "average per-bone radian" estimate.
+    rot_diff = src_world_rot[1:] - src_world_rot[:-1]
+    rot_motion = np.linalg.norm(rot_diff.reshape(T - 1, -1), axis=1) / np.sqrt(
+        2.0 * J
+    )
+
+    pos_diff = src_root_pos[1:] - src_root_pos[:-1]
+    pos_motion = np.linalg.norm(pos_diff, axis=1)
+
+    is_moving = (rot_motion > rot_threshold_rad) | (pos_motion > pos_threshold_m)
+    moving_idx = np.where(is_moving)[0]
+    if moving_idx.size == 0:
+        return src_world_rot, src_root_pos, 0, T - 1
+
+    first_kept = max(0, int(moving_idx[0]) - pad_frames)
+    last_kept = min(T - 1, int(moving_idx[-1]) + 1 + pad_frames)
+
+    if (last_kept - first_kept + 1) < min_keep_frames:
+        return src_world_rot, src_root_pos, 0, T - 1
+    if first_kept == 0 and last_kept == T - 1:
+        return src_world_rot, src_root_pos, 0, T - 1
+
+    return (
+        src_world_rot[first_kept : last_kept + 1],
+        src_root_pos[first_kept : last_kept + 1],
+        first_kept,
+        last_kept,
+    )
+
+
 # ---- Height-anchoring strategies ----------------------------------------- #
 
 # Why this is its own concept (vs. just using ``RobotState.fix_height``):
@@ -479,6 +552,10 @@ def _process_action(
     foot_offset: float,
     output_dir: Path,
     height_mode: str = "global",
+    trim_static: bool = True,
+    trim_rot_threshold: float = 0.005,
+    trim_pos_threshold: float = 0.0008,
+    trim_pad_frames: int = 1,
 ):
     src_world_rot = _ortho_normalize_batch(action["world_rot"])  # strip Blender scale
     src_world_pos = action["world_pos"]  # (T, J, 3)
@@ -505,6 +582,30 @@ def _process_action(
     if src_world_rot.shape[0] < 2:
         print(f"  [skip] {name}: only {src_world_rot.shape[0]} frame(s) after downsample")
         return
+
+    # Trim leading/trailing static "padding" frames produced by FBX exporters.
+    # We do this *after* downsampling so the thresholds correspond to the
+    # output frame rate (i.e. radians-per-output-frame, metres-per-output-frame).
+    if trim_static:
+        T_before = src_world_rot.shape[0]
+        src_world_rot, src_root_pos, first_kept, last_kept = _trim_static_frames(
+            src_world_rot=src_world_rot,
+            src_root_pos=src_root_pos,
+            rot_threshold_rad=trim_rot_threshold,
+            pos_threshold_m=trim_pos_threshold,
+            pad_frames=trim_pad_frames,
+        )
+        T_after = src_world_rot.shape[0]
+        if T_after < T_before:
+            trimmed_head = first_kept
+            trimmed_tail = (T_before - 1) - last_kept
+            print(
+                f"  trimmed static padding: kept frames [{first_kept}..{last_kept}] "
+                f"({T_after}/{T_before}, removed {trimmed_head} head + {trimmed_tail} tail)"
+            )
+        if src_world_rot.shape[0] < 2:
+            print(f"  [skip] {name}: only {src_world_rot.shape[0]} frame(s) after trim")
+            return
 
     root_pos, _, smpl_local = retarget_action(
         source_world_rot=src_world_rot,
@@ -768,6 +869,37 @@ def main(
             "'disable' leaves the FK output untouched."
         ),
     ),
+    trim_static: bool = typer.Option(
+        True,
+        help=(
+            "Strip leading/trailing frames that hold the rest pose (FBX "
+            "padding from force-start/end keying or multi-take exports). "
+            "Pass --no-trim-static to keep the original frame count, e.g. "
+            "for clips that are *intentionally* a static pose."
+        ),
+    ),
+    trim_rot_threshold: float = typer.Option(
+        0.005,
+        help=(
+            "Per-frame avg-bone rotation delta (radians) below which a frame "
+            "is treated as 'no motion' for trimming. ~0.005 rad ≈ 0.3°/frame. "
+            "Increase to be more aggressive, decrease to preserve subtle motion."
+        ),
+    ),
+    trim_pos_threshold: float = typer.Option(
+        0.0008,
+        help=(
+            "Per-frame root translation delta (metres) below which a frame "
+            "is treated as 'no motion' for trimming."
+        ),
+    ),
+    trim_pad_frames: int = typer.Option(
+        1,
+        help=(
+            "Extra frames to keep on each side of the detected motion span. "
+            "Helps avoid clipping the very first/last bit of motion."
+        ),
+    ),
 ):
     if height_mode not in HEIGHT_MODES:
         raise typer.BadParameter(
@@ -889,6 +1021,10 @@ def main(
                 foot_offset=foot_offset,
                 output_dir=output_dir,
                 height_mode=height_mode,
+                trim_static=trim_static,
+                trim_rot_threshold=trim_rot_threshold,
+                trim_pos_threshold=trim_pos_threshold,
+                trim_pad_frames=trim_pad_frames,
             )
         except Exception as e:  # noqa: BLE001
             import traceback
