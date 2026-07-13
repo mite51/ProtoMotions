@@ -103,6 +103,90 @@ def max_coords_obs_factory(
     )
 
 
+def collision_primitives_obs_factory(
+    num_obs_primitives: int = 6,
+    use_noisy: bool = False,
+    selection_range: float = 8.0,
+    distance_weight: float = 1.0,
+    closing_speed_weight: float = 1.0,
+    mass_weight: float = 0.25,
+    distance_scale: float = 2.0,
+    speed_scale: float = 10.0,
+    mass_scale: float = 10.0,
+) -> MdpComponent:
+    """Factory for the unified collision-primitive observation.
+
+    Emits the K highest-priority collision primitives (ground, obstacles,
+    projectiles, and other characters' key bodies) in the egocentric 17-float
+    layout. Priority combines range, body distance, closing speed, and mass.
+    Output width is ``num_obs_primitives * 17`` and is independent of the
+    candidate-buffer capacity (``EnvConfig.max_collision_primitives``), so this
+    width is part of the frozen observation architecture across all training tiers.
+
+    Args:
+        num_obs_primitives: K, number of prioritized primitives included in the obs.
+            Must be <= ``EnvConfig.max_collision_primitives``.
+        use_noisy: If True, use noisy robot state for the egocentric frame.
+
+    Returns:
+        MdpComponent configured for collision-primitive observations.
+    """
+    from protomotions.envs.obs import compute_collision_primitives_obs
+
+    state = EnvContext.noisy if use_noisy else EnvContext.current
+    primitives = EnvContext.collision_primitives
+
+    return MdpComponent(
+        compute_func=compute_collision_primitives_obs,
+        dynamic_vars={
+            "body_pos": state.rigid_body_pos,
+            "body_rot": state.rigid_body_rot,
+            "body_vel": state.rigid_body_vel,
+            "primitive_pos": primitives.pos,
+            "primitive_rot": primitives.rot,
+            "primitive_lin_vel": primitives.lin_vel,
+            "primitive_radius": primitives.radius,
+            "primitive_extent_z": primitives.extent_z,
+            "primitive_damage": primitives.damage,
+            "primitive_mass": primitives.mass,
+            "primitive_shape": primitives.shape,
+            "primitive_valid": primitives.valid,
+        },
+        static_params={
+            "num_obs_primitives": num_obs_primitives,
+            "selection_range": selection_range,
+            "distance_weight": distance_weight,
+            "closing_speed_weight": closing_speed_weight,
+            "mass_weight": mass_weight,
+            "distance_scale": distance_scale,
+            "speed_scale": speed_scale,
+            "mass_scale": mass_scale,
+            "w_last": True,
+        },
+    )
+
+
+def stamina_obs_factory() -> MdpComponent:
+    """Factory for the per-body stamina observation.
+
+    Emits one scalar per actuated body (current joint-drive strength, 1.0 == full).
+    Output width is the robot's actuated-body count and is part of the frozen
+    observation architecture. Include this from the Tier 1 base (stamina == 1.0,
+    inert) so later tiers that randomize stamina warm-start without an obs-shape
+    change.
+
+    Returns:
+        MdpComponent configured for the per-body stamina observation.
+    """
+    from protomotions.envs.obs import compute_stamina_obs
+
+    return MdpComponent(
+        compute_func=compute_stamina_obs,
+        dynamic_vars={"body_stamina": EnvContext.body_stamina},
+        static_params={},
+    )
+
+
 def reduced_coords_obs_factory(
     use_noisy: bool = False,
     root_height_obs: bool = False,
@@ -706,6 +790,87 @@ def contact_force_change_rew_factory(
     )
 
 
+def body_impact_penalty_rew_factory(
+    vulnerable_body_indices,
+    weight: float = -0.01,
+    threshold: float = 50.0,
+    min_value: Optional[float] = None,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the dangerous-impact penalty (Tier-2 fighting curriculum).
+
+    Penalizes high contact force on vulnerable bodies (everything EXCEPT hands and
+    feet), scaled by the per-env incoming threat ``incoming_damage`` (max damage of
+    active incoming colliders). With only ground/baseline colliders the penalty is
+    ~0, so the policy specifically learns to avoid/brace damaging impacts.
+
+    Args:
+        vulnerable_body_indices: Body indices to penalize (hands/feet excluded).
+            Resolve from the robot config in the experiment file.
+        weight: Reward weight (negative).
+        threshold: Contact-force magnitude below which impacts are ignored.
+        min_value: Optional minimum clamp on the (post-weight) reward.
+        zero_during_grace_period: If True, zero reward during the reset grace period.
+
+    Returns:
+        MdpComponent configured for the dangerous-impact penalty.
+    """
+    import torch
+
+    from protomotions.envs.rewards import compute_body_impact_penalty
+
+    body_indices = torch.as_tensor(list(vulnerable_body_indices), dtype=torch.long)
+    static_params = {
+        "weight": weight,
+        "threshold": threshold,
+        "body_indices": body_indices,
+        "zero_during_grace_period": zero_during_grace_period,
+    }
+    if min_value is not None:
+        static_params["min_value"] = min_value
+
+    return MdpComponent(
+        compute_func=compute_body_impact_penalty,
+        dynamic_vars={
+            "current_contact_force_magnitudes": EnvContext.current_contact_force_magnitudes,
+            "incoming_damage": EnvContext.incoming_damage,
+        },
+        static_params=static_params,
+    )
+
+
+def opponent_impact_rew_factory(
+    weight: float = 0.1,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the opponent-impact reward (multi-character self-play tier).
+
+    Rewards landing fast limb (hand/foot) strikes on opponents. The environment
+    precomputes a per-character striking signal (max closing speed of a striking
+    body toward an in-range opponent key body); this factory just applies a positive
+    weight. Identically zero with a single character, so it is safe in any config.
+
+    Args:
+        weight: Reward weight (positive).
+        zero_during_grace_period: If True, zero reward during the reset grace period.
+
+    Returns:
+        MdpComponent configured for the opponent-impact reward.
+    """
+    from protomotions.envs.rewards import compute_opponent_impact_reward
+
+    return MdpComponent(
+        compute_func=compute_opponent_impact_reward,
+        dynamic_vars={
+            "opponent_impact": EnvContext.opponent_impact,
+        },
+        static_params={
+            "weight": weight,
+            "zero_during_grace_period": zero_during_grace_period,
+        },
+    )
+
+
 # =============================================================================
 # Termination Factories
 # =============================================================================
@@ -1266,6 +1431,8 @@ def steering_velocity_error_factory(
 __all__ = [
     # Observation factories
     "max_coords_obs",
+    "collision_primitives_obs_factory",
+    "stamina_obs_factory",
     "reduced_coords_obs",
     "historical_max_coords_obs",
     "historical_reduced_coords_obs",
@@ -1285,6 +1452,8 @@ __all__ = [
     "pow_rew",
     "contact_match_rew",
     "contact_force_change_rew",
+    "body_impact_penalty_rew_factory",
+    "opponent_impact_rew_factory",
     # BeyondMimic reward factories
     "global_anchor_pos_rew",
     "global_anchor_ori_rew",

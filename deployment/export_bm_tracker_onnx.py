@@ -196,6 +196,31 @@ class _MockHistorical:
         self.anchor_ang_vel = torch.randn(num_envs, history_steps, 3)
 
 
+class _MockCollisionPrimitives:
+    """Mock for CollisionPrimitivesView (fighting-mimic obs).
+
+    Mirrors ``protomotions/envs/context_views.py::CollisionPrimitivesView`` so the
+    ``collision_primitives`` obs kernel resolves its bindings during tracing. ``M``
+    is the candidate-buffer capacity (``EnvConfig.max_collision_primitives``); the
+    kernel itself selects the frozen K nearest, so the traced graph's K is fixed by
+    the obs config, independent of M.
+    """
+
+    def __init__(self, num_envs: int, num_primitives: int):
+        import torch
+        import torch.nn.functional as F
+
+        m = num_primitives
+        self.pos      = torch.randn(num_envs, m, 3)
+        self.rot      = F.normalize(torch.randn(num_envs, m, 4), dim=-1)
+        self.lin_vel  = torch.randn(num_envs, m, 3)
+        self.radius   = torch.rand(num_envs, m)
+        self.extent_z = torch.rand(num_envs, m)
+        self.damage   = torch.rand(num_envs, m)
+        self.shape    = torch.zeros(num_envs, m, 2)
+        self.valid    = torch.ones(num_envs, m)
+
+
 class MockContext:
     """Minimal stand-in for EnvContext used only during ONNX export tracing."""
 
@@ -207,6 +232,9 @@ class MockContext:
         num_future_steps: int,
         anchor_idx: int,
         history_steps: int = 1,
+        num_primitives: int = 16,
+        num_stamina_bodies: int = 0,
+        num_contact_bodies: int | None = None,
     ):
         import torch
 
@@ -215,10 +243,22 @@ class MockContext:
         self.historical = _MockHistorical(
             num_envs, history_steps, num_dofs, num_bodies
         )
-        # body_contacts: used by max_coords_obs observe_contacts
-        self.body_contacts  = torch.zeros(num_envs, num_bodies, dtype=torch.bool)
+        # body_contacts: used by max_coords_obs observe_contacts. Width must match
+        # the env's frozen contact-body subset (len(contact_body_ids)), NOT the full
+        # body count — otherwise the concatenated obs width (and the actor's first
+        # layer) won't match the trained checkpoint.
+        if num_contact_bodies is None:
+            num_contact_bodies = num_bodies
+        self.body_contacts  = torch.zeros(num_envs, num_contact_bodies, dtype=torch.bool)
         # ground_heights: used by max_coords_obs root_height_obs
         self.ground_heights = torch.zeros(num_envs)
+
+        # Fighting-mimic bindings (harmless for non-fight configs that never
+        # request them — the obs module only resolves the keys its actor needs).
+        self.collision_primitives = _MockCollisionPrimitives(num_envs, num_primitives)
+        # One stamina scalar per actuated body; default 1.0 (full strength / inert).
+        if num_stamina_bodies > 0:
+            self.body_stamina = torch.ones(num_envs, num_stamina_bodies)
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +422,32 @@ def export_tracker(
     # ------------------------------------------------------------------
     # 4. Build MockContext for ONNX tracing shape inference
     # ------------------------------------------------------------------
+    # Fighting-mimic dimensions (default to inert values for stock trackers):
+    #   M  = collision-primitive candidate-buffer capacity
+    #   num_stamina_bodies = one stamina scalar per actuated body
+    num_primitives = int(getattr(env_config, "max_collision_primitives", 16))
+    hinge_axes_map = getattr(robot_config.kinematic_info, "hinge_axes_map", None)
+    num_stamina_bodies = len(hinge_axes_map) if hinge_axes_map is not None else 0
+
+    # Contact-body subset width: max_coords_obs(observe_contacts=True) emits one
+    # channel per body in robot_config.contact_bodies (resolved against body_names),
+    # which is typically a small frozen subset (feet/hands/head/torso), not all bodies.
+    num_contact_bodies = num_bodies
+    contact_bodies = getattr(robot_config, "contact_bodies", None)
+    if contact_bodies is not None:
+        from protomotions.components.pose_lib import build_body_ids_tensor
+
+        num_contact_bodies = len(
+            build_body_ids_tensor(body_names, contact_bodies, "cpu")
+        )
+
+    if "collision_primitives" in actor_obs_keys or "stamina_obs" in actor_obs_keys:
+        log.info(
+            f"Fighting-mimic obs detected: M={num_primitives} primitives, "
+            f"{num_stamina_bodies} stamina bodies, "
+            f"{num_contact_bodies} contact bodies"
+        )
+
     mock = MockContext(
         num_envs=1,
         num_dofs=num_dofs,
@@ -389,6 +455,9 @@ def export_tracker(
         num_future_steps=num_future_steps,
         anchor_idx=anchor_body_index,
         history_steps=history_steps,
+        num_primitives=num_primitives,
+        num_stamina_bodies=num_stamina_bodies,
+        num_contact_bodies=num_contact_bodies,
     )
 
     # ------------------------------------------------------------------

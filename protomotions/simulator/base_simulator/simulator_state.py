@@ -25,6 +25,7 @@ Key concepts:
 - RootOnlyState: Convenience class for root-only data.
 """
 
+import logging
 from dataclasses import dataclass, fields
 from typing import Dict, Optional, Callable, TypeVar, Tuple
 from abc import ABC, abstractmethod
@@ -32,6 +33,73 @@ from enum import Enum
 
 import torch
 from protomotions.utils import rotations
+
+logger = logging.getLogger(__name__)
+
+
+# When True, RobotState tolerates non-finite simulator state instead of asserting:
+# offending entries are sanitized (rotations -> identity, everything else -> 0) and a
+# throttled warning is logged. This is an OPT-IN robustness mode for impact-heavy
+# training (e.g. the fighting-game tiers) where a rare PhysX solver blowup from a hard
+# projectile impact would otherwise crash a multi-hour run. The sanitized env produces
+# large tracking error and is reset by the normal termination path on the next step.
+# Default False preserves the strict fail-fast behavior for all other training.
+_SANITIZE_NON_FINITE_STATE = False
+# Throttle warning spam: log at most once per this many sanitize events.
+_SANITIZE_WARN_EVERY = 200
+_sanitize_event_count = 0
+
+
+def set_sanitize_non_finite_state(enabled: bool) -> None:
+    """Enable/disable opt-in sanitize-instead-of-assert for non-finite RobotState."""
+    global _SANITIZE_NON_FINITE_STATE
+    _SANITIZE_NON_FINITE_STATE = bool(enabled)
+
+
+def get_sanitize_non_finite_state() -> bool:
+    """Whether opt-in non-finite tolerance is enabled (see set_sanitize_non_finite_state)."""
+    return _SANITIZE_NON_FINITE_STATE
+
+
+def _finite_or_sanitize(name: str, tensor):
+    """Validate a state field is finite.
+
+    Returns ``tensor`` unchanged when finite. When non-finite: raises (strict, the
+    default) or — if ``set_sanitize_non_finite_state(True)`` was called — sanitizes the
+    offending values (rotations -> identity quaternion, everything else -> 0), logs a
+    throttled warning, and returns the repaired tensor so the step can complete. The
+    affected env then fails tracking and is reset by the normal termination path.
+    """
+    if tensor is None or torch.all(torch.isfinite(tensor)):
+        return tensor
+
+    bad_mask = ~torch.isfinite(tensor)
+    if tensor.dim() >= 2:
+        bad_envs = bad_mask.reshape(tensor.shape[0], -1).any(dim=1)
+        bad_env_ids = torch.nonzero(bad_envs, as_tuple=False).flatten()
+        msg = (
+            f"{name} is not finite. "
+            f"{bad_env_ids.numel()}/{tensor.shape[0]} envs affected. "
+            f"Bad env indices (first 10): {bad_env_ids[:10].tolist()}"
+        )
+    else:
+        bad_ids = torch.nonzero(bad_mask, as_tuple=False).flatten()
+        msg = f"{name} is not finite at indices: {bad_ids[:10].tolist()}"
+
+    if not _SANITIZE_NON_FINITE_STATE:
+        raise AssertionError(msg)
+
+    global _sanitize_event_count
+    if _sanitize_event_count % _SANITIZE_WARN_EVERY == 0:
+        logger.warning("Sanitizing non-finite simulator state: %s", msg)
+    _sanitize_event_count += 1
+
+    sanitized = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+    if "rot" in name:
+        row_bad = bad_mask.reshape(bad_mask.shape[0], -1).any(dim=1)
+        sanitized[row_bad] = 0.0
+        sanitized[row_bad, ..., -1] = 1.0  # identity quaternion (xyzw)
+    return sanitized
 
 
 @dataclass
@@ -561,32 +629,18 @@ class RobotState(BaseBatchedState):
         return translation_vecs
 
     def __post_init__(self):
-        self._check_finite("rigid_body_pos", self.rigid_body_pos)
-        self._check_finite("rigid_body_rot", self.rigid_body_rot)
-        self._check_finite("rigid_body_vel", self.rigid_body_vel)
-        self._check_finite("rigid_body_ang_vel", self.rigid_body_ang_vel)
-        self._check_finite("dof_pos", self.dof_pos)
-        self._check_finite("dof_vel", self.dof_vel)
+        # Reassign in case the field was sanitized (opt-in non-finite recovery mode).
+        self.rigid_body_pos = self._check_finite("rigid_body_pos", self.rigid_body_pos)
+        self.rigid_body_rot = self._check_finite("rigid_body_rot", self.rigid_body_rot)
+        self.rigid_body_vel = self._check_finite("rigid_body_vel", self.rigid_body_vel)
+        self.rigid_body_ang_vel = self._check_finite(
+            "rigid_body_ang_vel", self.rigid_body_ang_vel
+        )
+        self.dof_pos = self._check_finite("dof_pos", self.dof_pos)
+        self.dof_vel = self._check_finite("dof_vel", self.dof_vel)
 
-    def _check_finite(self, name: str, tensor) -> None:
-        if tensor is None:
-            return
-        if torch.all(torch.isfinite(tensor)):
-            return
-        # Identify which envs have non-finite values
-        bad_mask = ~torch.isfinite(tensor)
-        if tensor.dim() >= 2:
-            bad_envs = bad_mask.any(dim=tuple(range(1, tensor.dim())))
-            bad_env_ids = torch.nonzero(bad_envs, as_tuple=False).flatten()
-            msg = (
-                f"{name} is not finite. "
-                f"{bad_env_ids.numel()}/{tensor.shape[0]} envs affected. "
-                f"Bad env indices (first 10): {bad_env_ids[:10].tolist()}"
-            )
-        else:
-            bad_ids = torch.nonzero(bad_mask, as_tuple=False).flatten()
-            msg = f"{name} is not finite at indices: {bad_ids[:10].tolist()}"
-        raise AssertionError(msg)
+    def _check_finite(self, name: str, tensor):
+        return _finite_or_sanitize(name, tensor)
 
 
 @dataclass
@@ -649,22 +703,10 @@ class RootOnlyState(BaseBatchedState):
         self.root_pos = self.root_pos + translation
 
     def __post_init__(self):
-        if self.root_pos is not None:
-            assert torch.all(
-                torch.isfinite(self.root_pos)
-            ), f"root_pos is not finite: {self.root_pos}"
-        if self.root_rot is not None:
-            assert torch.all(
-                torch.isfinite(self.root_rot)
-            ), f"root_rot is not finite: {self.root_rot}"
-        if self.root_vel is not None:
-            assert torch.all(
-                torch.isfinite(self.root_vel)
-            ), f"root_vel is not finite: {self.root_vel}"
-        if self.root_ang_vel is not None:
-            assert torch.all(
-                torch.isfinite(self.root_ang_vel)
-            ), f"root_ang_vel is not finite: {self.root_ang_vel}"
+        self.root_pos = _finite_or_sanitize("root_pos", self.root_pos)
+        self.root_rot = _finite_or_sanitize("root_rot", self.root_rot)
+        self.root_vel = _finite_or_sanitize("root_vel", self.root_vel)
+        self.root_ang_vel = _finite_or_sanitize("root_ang_vel", self.root_ang_vel)
 
 
 @dataclass
@@ -752,30 +794,12 @@ class ResetState(BaseBatchedState):
         self.root_pos = self.root_pos + translation
 
     def __post_init__(self):
-        if self.root_pos is not None:
-            assert torch.all(
-                torch.isfinite(self.root_pos)
-            ), f"root_pos is not finite: {self.root_pos}"
-        if self.root_rot is not None:
-            assert torch.all(
-                torch.isfinite(self.root_rot)
-            ), f"root_rot is not finite: {self.root_rot}"
-        if self.root_vel is not None:
-            assert torch.all(
-                torch.isfinite(self.root_vel)
-            ), f"root_vel is not finite: {self.root_vel}"
-        if self.root_ang_vel is not None:
-            assert torch.all(
-                torch.isfinite(self.root_ang_vel)
-            ), f"root_ang_vel is not finite: {self.root_ang_vel}"
-        if self.dof_pos is not None:
-            assert torch.all(
-                torch.isfinite(self.dof_pos)
-            ), f"dof_pos is not finite: {self.dof_pos}"
-        if self.dof_vel is not None:
-            assert torch.all(
-                torch.isfinite(self.dof_vel)
-            ), f"dof_vel is not finite: {self.dof_vel}"
+        self.root_pos = _finite_or_sanitize("root_pos", self.root_pos)
+        self.root_rot = _finite_or_sanitize("root_rot", self.root_rot)
+        self.root_vel = _finite_or_sanitize("root_vel", self.root_vel)
+        self.root_ang_vel = _finite_or_sanitize("root_ang_vel", self.root_ang_vel)
+        self.dof_pos = _finite_or_sanitize("dof_pos", self.dof_pos)
+        self.dof_vel = _finite_or_sanitize("dof_vel", self.dof_vel)
 
 
 @dataclass
@@ -844,19 +868,7 @@ class ObjectState(BaseBatchedState):
         self.root_pos = self.root_pos + translation
 
     def __post_init__(self):
-        if self.root_pos is not None:
-            assert torch.all(
-                torch.isfinite(self.root_pos)
-            ), f"root_pos is not finite: {self.root_pos}"
-        if self.root_rot is not None:
-            assert torch.all(
-                torch.isfinite(self.root_rot)
-            ), f"root_rot is not finite: {self.root_rot}"
-        if self.root_vel is not None:
-            assert torch.all(
-                torch.isfinite(self.root_vel)
-            ), f"root_vel is not finite: {self.root_vel}"
-        if self.root_ang_vel is not None:
-            assert torch.all(
-                torch.isfinite(self.root_ang_vel)
-            ), f"root_ang_vel is not finite: {self.root_ang_vel}"
+        self.root_pos = _finite_or_sanitize("root_pos", self.root_pos)
+        self.root_rot = _finite_or_sanitize("root_rot", self.root_rot)
+        self.root_vel = _finite_or_sanitize("root_vel", self.root_vel)
+        self.root_ang_vel = _finite_or_sanitize("root_ang_vel", self.root_ang_vel)

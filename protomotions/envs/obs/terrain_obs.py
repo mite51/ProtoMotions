@@ -57,8 +57,15 @@ class TerrainObs:
             env_ids: Environment indices to update
         """
         root_states = self.env.simulator.get_root_state(env_ids)
+        # The terrain's per-env height-point grid is sized by the physical scene
+        # count (E) and identical across envs. With multi-character self-play the
+        # env_ids are flattened character rows (up to E * N), so map them back to
+        # physical scenes for the grid lookup while keeping the per-character roots.
+        height_point_ids = env_ids
+        if self.env.num_characters > 1:
+            height_point_ids = env_ids // self.env.num_characters
         self.terrain_obs[env_ids] = self.env.terrain.get_height_maps(
-            root_states, env_ids
+            root_states, height_point_ids
         )
 
     def get_obs(self):

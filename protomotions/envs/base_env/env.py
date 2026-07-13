@@ -57,6 +57,7 @@ Key Features:
 
 """
 
+from dataclasses import fields
 from functools import cached_property
 from typing import Any, Dict, Optional, TYPE_CHECKING, Tuple
 
@@ -80,6 +81,7 @@ from protomotions.envs.context_views import (
     EnvContext,
     CurrentStateView,
     HistoricalView,
+    CollisionPrimitivesView,
 )
 from protomotions.envs.obs.observation_noise import (
     NoisyObservations,
@@ -103,11 +105,19 @@ from protomotions.components.pose_lib import compute_body_density_weights
 
 from protomotions.components.pose_lib import build_body_ids_tensor
 
-from protomotions.robot_configs.base import RobotConfig
+from protomotions.robot_configs.base import RobotConfig, ControlType
 
 if TYPE_CHECKING:
     from protomotions.components.scene_lib import SceneLib
     from protomotions.components.motion_lib import MotionLib
+
+
+# Upper bound (Newtons) used to sanitize per-body contact-force magnitudes. Real
+# humanoid contact forces stay well under this; the cap only neutralizes simulator
+# glitch spikes (deep penetrations from fast projectiles) that would otherwise be
+# inf/nan and poison the impact-penalty reward. Far above any physical value so it
+# does not distort normal-contact gradients.
+_MAX_CONTACT_FORCE = 1.0e5
 
 
 class BaseEnv:
@@ -166,13 +176,37 @@ class BaseEnv:
             **kwargs: Additional keyword arguments
         """
         self.config = config
+        # Pickled resolved configs predate newly-added dataclass fields and bypass
+        # dataclass initialization when unpickled. Backfill defaults so old fighting
+        # checkpoints remain usable with newer environment code.
+        default_config = EnvConfig()
+        for config_field in fields(EnvConfig):
+            if not hasattr(self.config, config_field.name):
+                setattr(
+                    self.config,
+                    config_field.name,
+                    getattr(default_config, config_field.name),
+                )
         self.robot_config = robot_config
         self.device = device
         self.terrain = terrain
         self.scene_lib = scene_lib
         self.motion_lib = motion_lib
         self.simulator = simulator
+        # Opt-in: tolerate rare non-finite simulator state (hard-impact solver
+        # blowups) by sanitizing + resetting the affected env instead of crashing.
+        if getattr(self.config, "sanitize_non_finite_state", False):
+            from protomotions.simulator.base_simulator.simulator_state import (
+                set_sanitize_non_finite_state,
+            )
+
+            set_sanitize_non_finite_state(True)
+        # Multi-character self-play: ``num_envs`` is the flattened per-character row
+        # count (E * N) seen by the RL agent; ``num_physical_envs`` (E) counts shared
+        # physical scenes / projectile pools. N == 1 makes them equal (legacy).
         self.num_envs = simulator.num_envs
+        self.num_physical_envs = simulator.num_physical_envs
+        self.num_characters = simulator.num_characters
 
         self.max_episode_length = self.config.max_episode_length
 
@@ -202,6 +236,16 @@ class BaseEnv:
         self._current_processed_action = torch.zeros(
             self.num_envs, num_actions, dtype=torch.float, device=self.device
         )
+
+        # Per-DOF "stamina" scale applied to PD gains (1.0 == full strength).
+        # Default of ones reproduces fixed-gain behaviour; components (e.g. the
+        # stamina manager in a later tier) overwrite this per-env, per-DOF.
+        self._dof_stamina_scale = torch.ones(
+            self.num_envs, num_actions, dtype=torch.float, device=self.device
+        )
+        # Runtime kwargs merged into the action function each step (see
+        # _process_action). Keys must match the action config's declared params.
+        self._runtime_action_inputs: Dict[str, Tensor] = {}
 
         # Global context cache - built once per step in post_physics_step
         # and reused by observations, rewards, and terminations
@@ -283,10 +327,54 @@ class BaseEnv:
 
         # Component infrastructure for MdpComponent
         self._component_manager = ComponentManager(self.device)
+        collision_component = self.config.observation_components.get(
+            "collision_primitives"
+        )
+        if collision_component is not None:
+            collision_component.dynamic_vars["primitive_mass"] = (
+                EnvContext.collision_primitives.mass
+            )
+            collision_component.static_params.update(
+                {
+                    "selection_range": self.config.collision_selection_range,
+                    "distance_weight": self.config.collision_distance_weight,
+                    "closing_speed_weight": self.config.collision_closing_speed_weight,
+                    "mass_weight": self.config.collision_mass_weight,
+                    "distance_scale": self.config.collision_distance_scale,
+                    "speed_scale": self.config.collision_speed_scale,
+                    "mass_scale": self.config.collision_mass_scale,
+                }
+            )
         self._observation_buffer: Dict[str, Tensor] = {}
         self._density_weights = compute_body_density_weights(
             self.robot_config.kinematic_info
         ).to(self.device)
+
+        # Projectile bookkeeping for the collision-primitive layer: per-env, per-
+        # projectile "damage" metadata (randomized per episode) and the previous
+        # positions used to derive projectile velocity by finite difference. Must be
+        # set up before _initialize_observations() so the collision-primitive and
+        # stamina observation components see valid buffers on their first compute.
+        # Projectiles are a per-physical-scene resource, so these buffers are sized by
+        # num_physical_envs (E), not the flattened per-character count.
+        self._num_projectiles = self.simulator.num_projectiles
+        self._projectile_damage = torch.full(
+            (self.num_physical_envs, self._num_projectiles),
+            self.config.projectile_baseline_damage,
+            device=self.device,
+        )
+        self._prev_projectile_pos = torch.zeros(
+            self.num_physical_envs, self._num_projectiles, 3, device=self.device
+        )
+        self._prev_projectile_active = torch.zeros(
+            self.num_physical_envs, self._num_projectiles, device=self.device
+        )
+        self._randomize_projectile_damage(
+            torch.arange(self.num_physical_envs, device=self.device)
+        )
+
+        self._init_body_stamina()
+        self._init_multi_character()
 
         # Initialize observations
         self._initialize_observations()
@@ -420,6 +508,30 @@ class BaseEnv:
 
     _action_config_device_ready: bool = False
 
+    def set_dof_stamina_scale(
+        self, stamina: Tensor, env_ids: Optional[Tensor] = None
+    ) -> None:
+        """Set the per-DOF stamina scale applied to PD gains (legacy PROPORTIONAL).
+
+        Stamina scales the joint drive (``1.0`` == nominal). The value is forwarded
+        to the action function via ``_runtime_action_inputs`` under the ``"stamina"``
+        key, so it only takes effect when the active action config declares a
+        ``stamina`` parameter (e.g. ``make_pd_stamina_action_config``) and the robot
+        uses ``ControlType.PROPORTIONAL``. For the default BUILT_IN_PD path stamina
+        is applied via ``Simulator.set_joint_gain_scale`` instead (see
+        ``_apply_body_stamina_to_gains``).
+
+        Args:
+            stamina: Per-DOF stamina, shape [num_envs, num_actions] or
+                [len(env_ids), num_actions].
+            env_ids: Optional subset of environments to update.
+        """
+        if env_ids is None:
+            self._dof_stamina_scale[:] = stamina
+        else:
+            self._dof_stamina_scale[env_ids] = stamina
+        self._runtime_action_inputs["stamina"] = self._dof_stamina_scale
+
     def _process_action(self, action: Tensor, context: EnvContext) -> Dict[str, Tensor]:
         """Process action using single action config dict.
 
@@ -438,6 +550,12 @@ class BaseEnv:
         fn = self.config.action_config["fn"]
         # Extract all params except "fn"
         params = {k: v for k, v in self.config.action_config.items() if k != "fn"}
+        # Runtime overrides injected by components (e.g. per-env, per-DOF "stamina").
+        # Only override keys the action config already declares, so we never pass an
+        # unexpected kwarg to the action function.
+        for key, value in self._runtime_action_inputs.items():
+            if key in params:
+                params[key] = value
         params["action"] = action
         return fn(**params)
 
@@ -535,7 +653,102 @@ class BaseEnv:
 
         respawn_offset[:, 2] += self.config.ref_respawn_offset
 
+        # Multi-character self-play: the N characters sharing a physical scene must
+        # spawn at the SAME sampled location (they are then separated only by the
+        # small per-character spawn circle). Broadcast each scene's first-row offset
+        # to all of that scene's character rows so they end up co-located and able to
+        # interact, rather than scattered to independent random terrain locations.
+        if self.num_characters > 1:
+            phys = env_ids // self.num_characters
+            uniq, inverse = torch.unique(phys, return_inverse=True, sorted=True)
+            order = torch.arange(env_ids.numel(), device=self.device)
+            first_idx = torch.full(
+                (uniq.numel(),),
+                env_ids.numel(),
+                dtype=torch.long,
+                device=self.device,
+            )
+            first_idx = first_idx.scatter_reduce(
+                0, inverse, order, reduce="amin", include_self=True
+            )
+            shared_offset = respawn_offset[first_idx[inverse]]
+            respawn_offset[:, :2] = shared_offset[:, :2]
+
         self.respawn_root_offset[env_ids] = respawn_offset
+
+    def _place_multi_character_reference_states(
+        self, env_ids: Tensor, ref_state: RobotState
+    ) -> None:
+        """Translate sampled roots so their near-future paths approach one point."""
+        if self.num_characters <= 1 or env_ids.numel() == 0:
+            return
+
+        N = self.num_characters
+        if env_ids.numel() % N != 0:
+            raise ValueError("Multi-character reference placement requires full scenes")
+        rows = env_ids.view(-1, N)
+        num_scenes = rows.shape[0]
+
+        lookahead_jitter = self.config.character_spawn_radius_variance
+        scene_lookahead = self.config.character_interaction_lookahead * (
+            1.0
+            + (torch.rand(num_scenes, 1, device=self.device) * 2.0 - 1.0)
+            * lookahead_jitter
+        )
+        lookahead = scene_lookahead.expand(-1, N).reshape(-1).clamp_min(0.0)
+        future_times = self.motion_manager.motion_times[env_ids] + lookahead
+        motion_lengths = self.motion_lib.get_motion_length(
+            self.motion_manager.motion_ids[env_ids]
+        )
+        future_times = torch.minimum(future_times, motion_lengths)
+        future_state = self.motion_lib.get_motion_state(
+            self.motion_manager.motion_ids[env_ids], future_times
+        )
+
+        current_xy = ref_state.root_pos[:, :2]
+        displacement = future_state.root_pos[:, :2] - current_xy
+        displacement_norm = displacement.norm(dim=-1, keepdim=True)
+
+        from protomotions.utils.rotations import calc_heading
+
+        heading = calc_heading(ref_state.root_rot, w_last=True)
+        facing = torch.stack((torch.cos(heading), torch.sin(heading)), dim=-1)
+        fallback_distance = torch.full_like(
+            displacement_norm, self.config.character_spawn_radius
+        )
+        approach = torch.where(
+            displacement_norm > 0.05,
+            displacement,
+            facing * fallback_distance,
+        )
+
+        max_spawn_distance = self.config.character_spawn_radius * (
+            1.0 + self.config.character_spawn_radius_variance
+        )
+        approach_norm = approach.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+        approach = approach * torch.clamp(
+            max_spawn_distance / approach_norm, max=1.0
+        )
+
+        # The first sampled row already identifies the valid terrain anchor.
+        anchored_xy = current_xy + self.respawn_root_offset[env_ids, :2]
+        interaction_center = anchored_xy.view(num_scenes, N, 2)[:, 0, :]
+
+        char_ids = torch.arange(N, device=self.device, dtype=torch.float)
+        phase = torch.rand(num_scenes, 1, device=self.device) * (2.0 * torch.pi)
+        angles = phase + char_ids.unsqueeze(0) * (2.0 * torch.pi / N)
+        ring = torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
+        chord_factor = max(
+            2.0 * torch.sin(torch.tensor(torch.pi / N)).item(), 1.0e-6
+        )
+        min_target_radius = self.config.character_min_spawn_separation / chord_factor
+        target_radius = max(
+            self.config.character_interaction_target_radius, min_target_radius
+        )
+        target_xy = interaction_center.unsqueeze(1) + ring * target_radius
+
+        desired_xy = target_xy.reshape(-1, 2) - approach
+        self.respawn_root_offset[env_ids, :2] = desired_xy - current_xy
 
     def align_motion_with_humanoid(self, env_ids, root_pos):
         """Compute XY offset between humanoid spawn position and reference motion data.
@@ -667,7 +880,15 @@ class BaseEnv:
         processed_action = action_dict["processed_action"]
         self._current_processed_action[:] = processed_action
 
-        self.simulator.step(processed_action, markers_callback=self.get_markers_state)
+        # Forward per-step PD gains to the simulator. These are only consumed by
+        # PROPORTIONAL control (ignored otherwise), and enable runtime per-env,
+        # per-DOF gain modulation (the "stamina" feature).
+        self.simulator.step(
+            processed_action,
+            markers_callback=self.get_markers_state,
+            stiffness=action_dict.get("stiffness_targets"),
+            damping=action_dict.get("damping_targets"),
+        )
 
         self.post_physics_step()
 
@@ -774,10 +995,14 @@ class BaseEnv:
         for k, _ in rbs.get_shape_mapping(flattened=True).items():
             self.extras[f"raw/{k}"] = rbs.flatten_bodies(k)
 
-        # Update previous contact forces for next step's impact penalty
+        # Update previous contact forces for next step's impact penalty. Sanitize
+        # to match current_contact_force_magnitudes (see _MAX_CONTACT_FORCE) so a
+        # glitch-spike from a hard impact can't poison force-change rewards either.
         self.prev_contact_force_magnitudes[:] = torch.norm(
-            rbs.rigid_body_contact_forces, dim=-1
-        )
+            torch.nan_to_num(rbs.rigid_body_contact_forces, nan=0.0,
+                             posinf=_MAX_CONTACT_FORCE, neginf=-_MAX_CONTACT_FORCE),
+            dim=-1,
+        ).clamp_(max=_MAX_CONTACT_FORCE)
 
     def user_reset(self):
         """Force environments to reset on next check (triggered by user input)."""
@@ -802,6 +1027,28 @@ class BaseEnv:
         self.terrain_obs_cb.compute_observations(env_ids)
         if self.scene_lib.num_scenes() > 0:
             self.scene_obs_cb.compute_observations(env_ids)
+
+    def _expand_to_physical_scenes(self, env_ids: Tensor) -> Tensor:
+        """Expand flattened character rows to every sibling in their scenes."""
+        if self.num_characters <= 1 or env_ids.numel() == 0:
+            return env_ids
+        physical_ids = torch.unique(env_ids // self.num_characters, sorted=True)
+        character_ids = torch.arange(
+            self.num_characters, device=self.device, dtype=torch.long
+        )
+        return (
+            physical_ids.unsqueeze(1) * self.num_characters
+            + character_ids.unsqueeze(0)
+        ).reshape(-1)
+
+    def _couple_scene_flags(self, flags: Tensor) -> Tensor:
+        """Make a per-row flag true for all siblings when any scene row is true."""
+        if self.num_characters <= 1:
+            return flags
+        scene_flags = flags.view(
+            self.num_physical_envs, self.num_characters
+        ).any(dim=1, keepdim=True)
+        return scene_flags.expand(-1, self.num_characters).reshape(-1)
 
     def check_resets_and_terminations(self, context: EnvContext):
         """Check reset and termination conditions.
@@ -833,6 +1080,8 @@ class BaseEnv:
         comp_reset, comp_terminate, term_logging = self._process_terminations(context)
         reset_buf = reset_buf | comp_reset
         terminated = terminated | comp_terminate
+        reset_buf = self._couple_scene_flags(reset_buf)
+        terminated = self._couple_scene_flags(terminated)
         self.extras.update(term_logging)
 
         return reset_buf, terminated
@@ -881,10 +1130,17 @@ class BaseEnv:
             :, self.contact_body_ids
         ].bool()
 
-        # Contact force magnitudes for impact penalty rewards
+        # Contact force magnitudes for impact penalty rewards. Hard collisions
+        # (e.g. a fast thrown projectile penetrating a body) can produce extreme or
+        # non-finite contact forces in the simulator, which would overflow the
+        # float32 norm to inf/nan and poison any downstream reward (tripping the
+        # finite-reward assertion in combine_rewards). Sanitize once at the source so
+        # every consumer sees finite, physically-bounded magnitudes.
         current_contact_force_magnitudes = torch.norm(
-            current_state.rigid_body_contact_forces, dim=-1
-        )
+            torch.nan_to_num(current_state.rigid_body_contact_forces, nan=0.0,
+                             posinf=_MAX_CONTACT_FORCE, neginf=-_MAX_CONTACT_FORCE),
+            dim=-1,
+        ).clamp_(max=_MAX_CONTACT_FORCE)
 
         # Use cached noisy obs from post_physics_step when available.
         # During init/reset the cache is None — use clean (no-noise) fallback.
@@ -897,6 +1153,13 @@ class BaseEnv:
                 anchor_idx=anchor_idx,
                 ground_heights=ground_heights,
             )
+
+        collision_primitives = self._build_collision_primitives(
+            current_state, ground_heights
+        )
+
+        # Per-character opponent-impact signal (0 when single-character).
+        self._opponent_impact = self._compute_opponent_impact(current_state)
 
         # Build context with view wrappers
         ctx = EnvContext(
@@ -924,15 +1187,459 @@ class BaseEnv:
             body_contacts=body_contacts,
             current_contact_force_magnitudes=current_contact_force_magnitudes,
             prev_contact_force_magnitudes=self.prev_contact_force_magnitudes,
+            incoming_damage=getattr(self, "_incoming_damage", None),
+            body_stamina=getattr(self, "_body_stamina", None),
+            opponent_impact=getattr(self, "_opponent_impact", None),
             dt=self.dt,
             # Contact tracking
             contact_body_ids=self.contact_body_ids,
+            # Collision primitives (ground + obstacles/projectiles/characters)
+            collision_primitives=collision_primitives,
         )
 
         # Controllers populate their task-specific views
         self.control_manager.populate_context(ctx)
 
         return ctx
+
+    def _randomize_projectile_damage(self, env_ids: Tensor) -> None:
+        """Randomize per-projectile 'damage' for the given envs (per episode).
+
+        For each env, a random fraction of the projectile pool is designated
+        'dangerous' (damage sampled from ``projectile_damage_range``); the rest keep
+        ``projectile_baseline_damage``. This realizes "randomize damage on a random
+        number of colliders" so the policy learns to discriminate threats rather
+        than treating every collider identically.
+        """
+        num_e = env_ids.numel()
+        if num_e == 0 or self._num_projectiles == 0:
+            return
+        n = self._num_projectiles
+        device = self.device
+
+        frac_lo, frac_hi = self.config.projectile_dangerous_fraction_range
+        fraction = torch.rand(num_e, 1, device=device) * (frac_hi - frac_lo) + frac_lo
+        # Random per-(env, projectile) priority; the lowest `count` become dangerous.
+        priority = torch.rand(num_e, n, device=device)
+        count = torch.round(fraction * n)  # [num_e, 1]
+        rank = torch.argsort(torch.argsort(priority, dim=1), dim=1).to(priority.dtype)
+        dangerous_mask = rank < count  # [num_e, n] bool
+
+        dmg_lo, dmg_hi = self.config.projectile_damage_range
+        dangerous_damage = torch.rand(num_e, n, device=device) * (dmg_hi - dmg_lo) + dmg_lo
+        baseline = torch.full(
+            (num_e, n), self.config.projectile_baseline_damage, device=device
+        )
+        self._projectile_damage[env_ids] = torch.where(
+            dangerous_mask, dangerous_damage, baseline
+        )
+
+    def _init_body_stamina(self) -> None:
+        """Set up per-body 'stamina' and the body->DOF mapping used to scale gains.
+
+        Stamina is one scalar per actuated body (a body that has hinge DOFs). It
+        scales the PD gains of that body's parent joint and is exposed as an obs.
+        DOFs are emitted in ascending-body-index traversal order, so iterating
+        bodies in index order and counting their hinge DOFs reproduces the DOF order.
+        """
+        kin = self.robot_config.kinematic_info
+        hinge_axes_map = kin.hinge_axes_map
+        stamina_body_indices = sorted(hinge_axes_map.keys())
+        self._stamina_body_indices = stamina_body_indices
+        self._num_stamina_bodies = len(stamina_body_indices)
+
+        body_to_col = {b: c for c, b in enumerate(stamina_body_indices)}
+        dof_to_stamina_col = []
+        for body_idx in range(kin.num_bodies):
+            if body_idx in hinge_axes_map:
+                n_dofs = len(hinge_axes_map[body_idx])
+                dof_to_stamina_col.extend([body_to_col[body_idx]] * n_dofs)
+        self._dof_to_stamina_col = torch.tensor(
+            dof_to_stamina_col, dtype=torch.long, device=self.device
+        )
+
+        self._body_stamina = torch.ones(
+            self.num_envs, self._num_stamina_bodies, device=self.device
+        )
+        self._apply_body_stamina_to_gains(
+            torch.arange(self.num_envs, device=self.device)
+        )
+
+    def _init_multi_character(self) -> None:
+        """Set up per-character spawn offsets and opponent-body bookkeeping.
+
+        For single-character (N == 1) this is a no-op beyond allocating a trivial
+        spawn offset, so legacy behavior is unchanged. For N > 1 it precomputes:
+          - ``_character_spawn_offset`` [N, 2]: scene-local XY spawn positions.
+          - ``_opponent_key_body_ids`` [K]: body indices of opponent key bodies
+            (head/pelvis/limbs) that are exposed as collision primitives.
+          - ``_opponent_char_idx`` [N, N-1]: for each character, the indices of the
+            other characters in its scene.
+        """
+        from protomotions.simulator.base_simulator.utils import (
+            character_spawn_offsets,
+        )
+        from protomotions.simulator.base_simulator.config import (
+            get_matching_indices,
+        )
+
+        offsets = character_spawn_offsets(
+            self.num_characters, self.config.character_spawn_radius
+        )
+        self._character_spawn_offset = torch.tensor(
+            offsets, dtype=torch.float, device=self.device
+        )  # [N, 2]
+
+        self._opponent_impact = torch.zeros(self.num_envs, device=self.device)
+        self._robot_body_masses = self.simulator.get_robot_body_masses()
+
+        projectile_masses = []
+        for spec in self.simulator._proj_config.get_shape_specs():
+            if spec.shape_type == "box":
+                volume = spec.extent_z**3
+            elif spec.shape_type == "sphere":
+                volume = 4.0 * torch.pi * spec.radius**3 / 3.0
+            else:
+                volume = (
+                    torch.pi * spec.radius**2 * spec.extent_z
+                    + 4.0 * torch.pi * spec.radius**3 / 3.0
+                )
+            projectile_masses.append(
+                float(volume * self.simulator._proj_config.density)
+            )
+        self._projectile_masses = torch.tensor(
+            projectile_masses, dtype=torch.float, device=self.device
+        )
+
+        if self.num_characters <= 1:
+            self._opponent_key_body_ids = torch.zeros(
+                0, dtype=torch.long, device=self.device
+            )
+            self._striking_body_ids = torch.zeros(
+                0, dtype=torch.long, device=self.device
+            )
+            self._opponent_char_idx = None
+            return
+
+        body_names = self.robot_config.kinematic_info.body_names
+        key_ids = get_matching_indices(
+            body_names, names_to_match=list(self.config.opponent_key_body_names)
+        )
+        self._opponent_key_body_ids = torch.tensor(
+            sorted(key_ids), dtype=torch.long, device=self.device
+        )
+        strike_ids = get_matching_indices(
+            body_names, names_to_match=list(self.config.striking_body_names)
+        )
+        self._striking_body_ids = torch.tensor(
+            sorted(strike_ids), dtype=torch.long, device=self.device
+        )
+
+        N = self.num_characters
+        opp = [[c2 for c2 in range(N) if c2 != c] for c in range(N)]
+        self._opponent_char_idx = torch.tensor(
+            opp, dtype=torch.long, device=self.device
+        )  # [N, N-1]
+
+    def _compute_opponent_impact(self, current_state) -> Tensor:
+        """Per-character 'striking' signal for the opponent-impact reward.
+
+        For each character, finds the maximum closing speed of any of its striking
+        bodies (hands/feet) toward any opponent key body that is within
+        ``opponent_strike_radius``. Returns ``[num_envs]`` (0 when N == 1). This
+        rewards landing fast limb strikes on opponents (closing speed, gated by
+        proximity) rather than mere contact.
+        """
+        if (
+            self.num_characters <= 1
+            or self._striking_body_ids.numel() == 0
+            or self._opponent_key_body_ids.numel() == 0
+        ):
+            return torch.zeros(self.num_envs, device=self.device)
+
+        E = self.num_physical_envs
+        N = self.num_characters
+        B = current_state.rigid_body_pos.shape[1]
+        body_pos = current_state.rigid_body_pos.view(E, N, B, 3)
+        body_vel = current_state.rigid_body_vel.view(E, N, B, 3)
+
+        strike_pos = body_pos[:, :, self._striking_body_ids]  # [E, N, S, 3]
+        strike_vel = body_vel[:, :, self._striking_body_ids]
+        kb_pos = body_pos[:, :, self._opponent_key_body_ids]  # [E, N, K, 3]
+        kb_vel = body_vel[:, :, self._opponent_key_body_ids]
+
+        radius = self.config.opponent_strike_radius
+        impact = torch.zeros(E, N, device=self.device)
+        for c in range(N):
+            sp = strike_pos[:, c]  # [E, S, 3]
+            sv = strike_vel[:, c]
+            others = self._opponent_char_idx[c]  # [N-1]
+            op = kb_pos[:, others].reshape(E, -1, 3)  # [E, O, 3]
+            ov = kb_vel[:, others].reshape(E, -1, 3)
+            diff = op[:, None, :, :] - sp[:, :, None, :]  # [E, S, O, 3]
+            dist = diff.norm(dim=-1).clamp_min(1e-6)  # [E, S, O]
+            rel_vel = sv[:, :, None, :] - ov[:, None, :, :]  # [E, S, O, 3]
+            closing = (rel_vel * (diff / dist.unsqueeze(-1))).sum(-1)  # [E, S, O]
+            within = dist < radius
+            val = closing.clamp_min(0.0) * within
+            impact[:, c] = val.amax(dim=(1, 2))
+        return impact.reshape(E * N)
+
+    def _apply_body_stamina_to_gains(self, env_ids: Tensor) -> None:
+        """Expand per-body stamina to per-DOF and write the resulting PD gains.
+
+        Under BUILT_IN_PD the engine owns the PD loop, so stamina cannot be a
+        per-step action scaling; instead it multiplies the nominal per-DOF gains
+        and is written into the simulator for the given envs (a no-op on backends
+        that do not support runtime gain writes). ``env_ids`` are flattened RL
+        rows; the simulator routes them to physical scenes / characters.
+        """
+        if self._dof_to_stamina_col.numel() == 0:
+            return
+        per_dof = self._body_stamina[env_ids][:, self._dof_to_stamina_col]
+        if self.robot_config.control.control_type == ControlType.PROPORTIONAL:
+            # Legacy path: per-step gain scaling through the action pipeline
+            # (custom PD computed in Python). Kept for backward compatibility.
+            self.set_dof_stamina_scale(per_dof, env_ids)
+        else:
+            # BUILT_IN_PD (default): the engine owns the PD loop, so write the
+            # scaled per-DOF gains into the simulator instead.
+            self.simulator.set_joint_gain_scale(per_dof, env_ids)
+
+    def _randomize_body_stamina(self, env_ids: Tensor) -> None:
+        """Per-episode randomize per-body stamina (Tier-4 curriculum), then re-map."""
+        if env_ids.numel() == 0 or self._num_stamina_bodies == 0:
+            return
+        if self.config.randomize_body_stamina:
+            lo, hi = self.config.body_stamina_range
+            self._body_stamina[env_ids] = (
+                torch.rand(
+                    env_ids.numel(), self._num_stamina_bodies, device=self.device
+                )
+                * (hi - lo)
+                + lo
+            )
+        else:
+            self._body_stamina[env_ids] = 1.0
+        self._apply_body_stamina_to_gains(env_ids)
+
+    def _build_collision_primitives(
+        self, current_state, ground_heights: Tensor
+    ) -> CollisionPrimitivesView:
+        """Assemble the fixed-capacity collision-primitive candidate buffer.
+
+        Writes all discovered primitives into a temporary WORLD-frame tensor.
+        When the raw set exceeds M, all categories use the same contact-priority
+        score before compaction. Padding slots carry ``valid == 0``.
+
+        Phase 1 populates only the ground primitive (slot 0). Later tiers fill
+        additional slots with scene obstacles, thrown projectiles, and other
+        characters' key bodies via :meth:`_write_collision_primitives` hooks.
+        """
+        num_envs = self.num_envs
+        capacity = self.config.max_collision_primitives
+        device = self.device
+        N = self.num_characters
+        num_opponent_candidates = (
+            (N - 1) * self._opponent_key_body_ids.numel() if N > 1 else 0
+        )
+        raw_capacity = max(
+            capacity, 1 + self._num_projectiles + num_opponent_candidates
+        )
+
+        pos = torch.zeros(num_envs, raw_capacity, 3, device=device)
+        rot = torch.zeros(num_envs, raw_capacity, 4, device=device)
+        rot[..., 3] = 1.0  # identity quaternion (xyzw)
+        lin_vel = torch.zeros(num_envs, raw_capacity, 3, device=device)
+        radius = torch.zeros(num_envs, raw_capacity, device=device)
+        extent_z = torch.zeros(num_envs, raw_capacity, device=device)
+        damage = torch.zeros(num_envs, raw_capacity, device=device)
+        mass = torch.zeros(num_envs, raw_capacity, device=device)
+        shape = torch.zeros(num_envs, raw_capacity, 2, device=device)
+        valid = torch.zeros(num_envs, raw_capacity, device=device)
+
+        # Slot 0: ground box directly beneath the root. rel_pos.z then encodes how
+        # high the character is above ground (a richer replacement for root-height).
+        root_pos = current_state.rigid_body_pos[:, 0, :]
+        pos[:, 0, 0] = root_pos[:, 0]
+        pos[:, 0, 1] = root_pos[:, 1]
+        pos[:, 0, 2] = ground_heights
+        shape[:, 0, 0] = 1.0  # is_box
+        damage[:, 0] = self.config.ground_primitive_damage
+        mass[:, 0] = self.config.static_collider_effective_mass
+        valid[:, 0] = 1.0
+
+        # Slots 1..: active thrown projectiles (boxes). Velocity is derived by
+        # finite difference on positions (backend-agnostic), zeroed on the first
+        # active step to avoid the spike from the hidden->thrown teleport. Projectile
+        # state is per physical scene ([E, P, ...]); for multi-character self-play it
+        # is expanded so all N characters in a scene see the same projectiles.
+        incoming_damage = torch.zeros(num_envs, device=device)
+        num_proj = getattr(self, "_num_projectiles", 0)
+        next_slot = 1
+        if num_proj > 0:
+            proj = self.simulator.get_active_projectile_states()
+            proj_pos = proj["positions"][:, :num_proj]  # [E, P, 3]
+            proj_rot = proj["rotations"][:, :num_proj]  # [E, P, 4]
+            proj_active = proj["active"][:, :num_proj]  # [E, P]
+            # Per-projectile shape encoding (box/sphere/capsule). Per pool index, so
+            # independent of the character dimension (no N-expansion needed).
+            proj_radius = proj["radius"][:num_proj]  # [P]
+            proj_extent_z = proj["extent_z"][:num_proj]  # [P]
+            proj_shape = proj["shape"][:num_proj]  # [P, 2]
+
+            prev_pos = self._prev_projectile_pos[:, :num_proj]
+            prev_active = self._prev_projectile_active[:, :num_proj]
+            vel = (proj_pos - prev_pos) / self.dt
+            vel_valid = (prev_active > 0.5) & (proj_active > 0.5)
+            proj_vel = torch.where(vel_valid.unsqueeze(-1), vel, torch.zeros_like(vel))
+
+            proj_damage = self._projectile_damage[:, :num_proj]
+            # Per-scene incoming threat = max damage among active projectiles.
+            incoming_damage_phys = (proj_damage * proj_active).max(dim=1).values  # [E]
+
+            # Persist (physical) state for next-step finite difference BEFORE expanding.
+            self._prev_projectile_pos[:, :num_proj] = proj_pos
+            self._prev_projectile_active[:, :num_proj] = proj_active
+
+            if N > 1:
+                proj_pos = proj_pos.repeat_interleave(N, dim=0)
+                proj_rot = proj_rot.repeat_interleave(N, dim=0)
+                proj_vel = proj_vel.repeat_interleave(N, dim=0)
+                proj_active = proj_active.repeat_interleave(N, dim=0)
+                proj_damage = proj_damage.repeat_interleave(N, dim=0)
+                incoming_damage = incoming_damage_phys.repeat_interleave(N, dim=0)
+            else:
+                incoming_damage = incoming_damage_phys
+
+            pos[:, 1 : 1 + num_proj] = proj_pos
+            rot[:, 1 : 1 + num_proj] = proj_rot
+            lin_vel[:, 1 : 1 + num_proj] = proj_vel
+            # Per-projectile primitive shape: box -> radius=0, extent_z=full height,
+            # shape=[1,0]; sphere -> radius=r, extent_z=0, shape=[0,1]; capsule ->
+            # radius=r, extent_z=cyl length, shape=[0,0]. Broadcast [P] -> [E, P].
+            radius[:, 1 : 1 + num_proj] = proj_radius.unsqueeze(0)
+            extent_z[:, 1 : 1 + num_proj] = proj_extent_z.unsqueeze(0)
+            shape[:, 1 : 1 + num_proj] = proj_shape.unsqueeze(0)
+            damage[:, 1 : 1 + num_proj] = proj_damage
+            mass[:, 1 : 1 + num_proj] = self._projectile_masses[
+                :num_proj
+            ].unsqueeze(0)
+            valid[:, 1 : 1 + num_proj] = proj_active
+            next_slot = 1 + num_proj
+
+        self._incoming_damage = incoming_damage
+
+        # Other characters' key bodies (multi-character self-play).
+        # Each character observes the opponents in its physical scene as sphere
+        # primitives so it can perceive, avoid, and strike them. Bodies are written
+        # in world frame; the shared priority function handles any capacity cut.
+        if N > 1 and self._opponent_key_body_ids.numel() > 0:
+            self._write_opponent_primitives(
+                current_state, next_slot, pos, lin_vel, radius, mass, shape, valid
+            )
+
+        if raw_capacity > capacity:
+            from protomotions.envs.obs.collision_primitives import (
+                compute_collision_priority,
+            )
+
+            priority = compute_collision_priority(
+                body_pos=current_state.rigid_body_pos,
+                body_vel=current_state.rigid_body_vel,
+                primitive_pos=pos,
+                primitive_lin_vel=lin_vel,
+                primitive_mass=mass,
+                primitive_valid=valid,
+                selection_range=self.config.collision_selection_range,
+                distance_weight=self.config.collision_distance_weight,
+                closing_speed_weight=self.config.collision_closing_speed_weight,
+                mass_weight=self.config.collision_mass_weight,
+                distance_scale=self.config.collision_distance_scale,
+                speed_scale=self.config.collision_speed_scale,
+                mass_scale=self.config.collision_mass_scale,
+            )
+            keep = torch.topk(priority, capacity, dim=1, largest=True).indices
+
+            def _select(x: Tensor) -> Tensor:
+                if x.dim() == 2:
+                    return torch.gather(x, 1, keep)
+                idx = keep.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+                return torch.gather(x, 1, idx)
+
+            pos = _select(pos)
+            rot = _select(rot)
+            lin_vel = _select(lin_vel)
+            radius = _select(radius)
+            extent_z = _select(extent_z)
+            damage = _select(damage)
+            mass = _select(mass)
+            shape = _select(shape)
+            valid = _select(valid)
+
+        return CollisionPrimitivesView(
+            pos=pos,
+            rot=rot,
+            lin_vel=lin_vel,
+            radius=radius,
+            extent_z=extent_z,
+            damage=damage,
+            mass=mass,
+            shape=shape,
+            valid=valid,
+        )
+
+    def _write_opponent_primitives(
+        self,
+        current_state,
+        next_slot: int,
+        pos: Tensor,
+        lin_vel: Tensor,
+        radius: Tensor,
+        mass: Tensor,
+        shape: Tensor,
+        valid: Tensor,
+    ) -> None:
+        """Write opponents' key bodies into the collision-primitive buffers.
+
+        For each character row, the key bodies (head/pelvis/limbs) of the other
+        characters in the same physical scene are written as sphere primitives in
+        world frame, starting at slot ``next_slot``. The raw buffer is sized for
+        all opponents before category-neutral capacity selection.
+        """
+        E = self.num_physical_envs
+        N = self.num_characters
+        key_ids = self._opponent_key_body_ids
+        K = key_ids.numel()
+        capacity = pos.shape[1]
+
+        num_bodies = current_state.rigid_body_pos.shape[1]
+        body_pos = current_state.rigid_body_pos.view(E, N, num_bodies, 3)
+        body_vel = current_state.rigid_body_vel.view(E, N, num_bodies, 3)
+
+        kb_pos = body_pos[:, :, key_ids]  # [E, N, K, 3]
+        kb_vel = body_vel[:, :, key_ids]  # [E, N, K, 3]
+        body_mass = self._robot_body_masses.view(E, N, num_bodies)
+        kb_mass = body_mass[:, :, key_ids]
+
+        # Gather the opponents (N-1 of them) for each character, then flatten the
+        # (E, N) leading dims into the E*N row layout (row == e * N + c).
+        opp_idx = self._opponent_char_idx  # [N, N-1]
+        opp_pos = kb_pos[:, opp_idx].reshape(E * N, (N - 1) * K, 3)
+        opp_vel = kb_vel[:, opp_idx].reshape(E * N, (N - 1) * K, 3)
+        opp_mass = kb_mass[:, opp_idx].reshape(E * N, (N - 1) * K)
+
+        num_opp = opp_pos.shape[1]
+        n_write = min(num_opp, capacity - next_slot)
+        if n_write <= 0:
+            return
+        sl = slice(next_slot, next_slot + n_write)
+        pos[:, sl] = opp_pos[:, :n_write]
+        lin_vel[:, sl] = opp_vel[:, :n_write]
+        radius[:, sl] = self.config.opponent_body_radius
+        mass[:, sl] = opp_mass[:, :n_write]
+        shape[:, sl, 1] = 1.0  # sphere one-hot ([is_box, is_sphere] == [0, 1])
+        valid[:, sl] = 1.0
 
     def get_has_reset_grace(self):
         """Check if environments are in the grace period after reset.
@@ -973,10 +1680,18 @@ class BaseEnv:
         env_ids,
         new_states: ResetState,
         new_object_states: ObjectState,
+        apply_character_offset: bool = True,
     ) -> Tuple[ResetState, ObjectState]:
         new_states.root_pos += self.respawn_root_offset[env_ids]
         if self.scene_lib.num_scenes() > 0:
             new_object_states.root_pos += self.respawn_root_offset[env_ids].unsqueeze(1)
+
+        # Multi-character self-play: separate the N characters within a shared scene
+        # by their fixed per-character XY offset so they spawn apart but close enough
+        # to interact (character of row r == r % N).
+        if self.num_characters > 1 and apply_character_offset:
+            char_idx = env_ids % self.num_characters
+            new_states.root_pos[:, :2] += self._character_spawn_offset[char_idx]
 
         return new_states, new_object_states
 
@@ -1031,9 +1746,13 @@ class BaseEnv:
             ref_state=ref_state,
             sample_flat=sample_flat,
         )
+        self._place_multi_character_reference_states(env_ids, ref_state)
 
         return self.move_reset_robot_obj_states_to_respawn_position(
-            env_ids, new_states, new_object_states
+            env_ids,
+            new_states,
+            new_object_states,
+            apply_character_offset=False,
         )
 
     def reset(
@@ -1074,6 +1793,33 @@ class BaseEnv:
         if isinstance(env_ids, list):
             env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
         env_ids = env_ids.to(self.device)
+
+        # A physical multi-character scene is one episode. Resetting only one
+        # flattened row strands its opponents at the old anchor and motion time.
+        if self.num_characters > 1:
+            requested_env_ids = env_ids
+            expanded_env_ids = self._expand_to_physical_scenes(requested_env_ids)
+            if (
+                force_default_mask is not None
+                and expanded_env_ids.numel() != env_ids.numel()
+            ):
+                requested_mask = torch.as_tensor(
+                    force_default_mask, device=self.device, dtype=torch.bool
+                )
+                scene_default = torch.zeros(
+                    self.num_physical_envs, device=self.device, dtype=torch.long
+                )
+                scene_default.scatter_reduce_(
+                    0,
+                    requested_env_ids // self.num_characters,
+                    requested_mask.to(torch.long),
+                    reduce="amax",
+                    include_self=True,
+                )
+                force_default_mask = (
+                    scene_default[expanded_env_ids // self.num_characters] > 0
+                )
+            env_ids = expanded_env_ids
 
         # Start with default reset for all envs
         new_states, new_object_states = self.compute_default_reset_state(
@@ -1122,6 +1868,19 @@ class BaseEnv:
         self.prev_contact_force_magnitudes[env_ids] = 0.0
         self._current_raw_action[env_ids] = 0.0
         self._current_processed_action[env_ids] = 0.0
+
+        # Re-randomize projectile damage and clear finite-difference velocity state.
+        # Projectile buffers are per physical scene, so collapse character rows.
+        if self.num_characters > 1:
+            phys_ids = torch.unique(env_ids // self.num_characters)
+        else:
+            phys_ids = env_ids
+        self._randomize_projectile_damage(phys_ids)
+        self._prev_projectile_active[phys_ids] = 0.0
+
+        # Re-randomize per-body stamina (and re-map to per-DOF gains) for this episode.
+        # Stamina is per character, so it uses the (flattened) character rows directly.
+        self._randomize_body_stamina(env_ids)
 
         # Update cached noisy obs for the reset envs with fresh noise
         if self._current_noisy_obs is not None:

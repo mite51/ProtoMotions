@@ -24,12 +24,19 @@ This module handles:
 - Body indices resolution from names to indices
 """
 
+import logging
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import Tensor
 
 from protomotions.envs.mdp_component import is_mdp_component
+from protomotions.simulator.base_simulator.simulator_state import (
+    get_sanitize_non_finite_state,
+)
+
+logger = logging.getLogger(__name__)
+_reward_sanitize_warn_count = 0
 
 
 
@@ -82,8 +89,23 @@ def combine_rewards(
             reward = reward.clone()
             reward[grace_mask] = 0.0
         
-        # Sanity check
-        assert torch.all(torch.isfinite(reward)), f"Reward '{name}' not finite"
+        # Sanity check. A non-finite reward normally indicates a bug and fails fast.
+        # In the opt-in impact-robustness mode (set_sanitize_non_finite_state), a rare
+        # physics blowup can produce a huge-but-finite state that overflows a reward
+        # (e.g. power ~ vel^2); tolerate it by zeroing the offending env's reward this
+        # step. That env has already been flagged non-finite at the state level and is
+        # reset by the termination path, so a single zeroed reward is harmless.
+        if not torch.all(torch.isfinite(reward)):
+            if not get_sanitize_non_finite_state():
+                raise AssertionError(f"Reward '{name}' not finite")
+            global _reward_sanitize_warn_count
+            if _reward_sanitize_warn_count % 200 == 0:
+                bad = (~torch.isfinite(reward)).sum().item()
+                logger.warning(
+                    "Sanitizing non-finite reward '%s' (%d envs) to 0.", name, bad
+                )
+            _reward_sanitize_warn_count += 1
+            reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
         logging_dict[f"raw_r/{name}"] = reward.clone()
         
         # Apply multiplicative or additive combining

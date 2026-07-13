@@ -105,6 +105,11 @@ class Simulator(RecordingMixin, ABC):
         >>>     sim.step(actions)
     """
 
+    # Whether this backend realizes non-box projectile geometry (sphere/capsule).
+    # Only IsaacLab builds per-slot primitive shapes today; other backends create box
+    # colliders regardless of ``ProjectileConfig.shapes`` (see ``_init_projectiles``).
+    _supports_mixed_projectile_shapes: bool = False
+
     # -------------------------
     # ⚙️ Group 1: Initialization & Configuration
     # -------------------------
@@ -138,7 +143,16 @@ class Simulator(RecordingMixin, ABC):
         self.scene_lib = scene_lib  # Always provided (empty if no scenes)
         self.terrain = terrain  # Always provided
         self.headless: bool = self.config.headless
-        self.num_envs: int = self.config.num_envs
+        # Multi-character self-play: physical scenes (E) vs. RL rows (E * N).
+        # ``num_physical_envs`` counts IsaacLab scenes / terrain tiles / projectile
+        # pools (one set of per-scene resources). ``num_characters`` (N) is the number
+        # of policy-controlled articulations spawned *inside* each scene that
+        # physically interact. ``num_envs`` is the flattened per-character row count
+        # exposed to the RL agent (shared policy). N == 1 makes num_envs == E so all
+        # downstream shapes and behavior are byte-for-byte identical to legacy.
+        self.num_physical_envs: int = self.config.num_envs
+        self.num_characters: int = getattr(self.config, "num_characters", 1)
+        self.num_envs: int = self.num_physical_envs * self.num_characters
 
         self.control_type: ControlType = self.robot_config.control.control_type
         self.decimation: int = self.config.sim.decimation
@@ -410,46 +424,86 @@ class Simulator(RecordingMixin, ABC):
 
     def _init_projectiles(self) -> None:
         """Initialize projectile pool state and create physics bodies."""
-        self._proj_config = ProjectileConfig()
+        configured = getattr(self.config, "projectile", None)
+        self._proj_config = configured if configured is not None else ProjectileConfig()
         N = self._proj_config.num_projectiles
 
+        # Projectiles are a per-physical-scene resource (one pool per scene, shared by
+        # all characters in that scene), so all projectile bookkeeping is sized by
+        # num_physical_envs (E), never the flattened per-character count (E * N).
         self._proj_next_idx = torch.zeros(
-            self.num_envs, dtype=torch.long, device=self.device
+            self.num_physical_envs, dtype=torch.long, device=self.device
         )
         self._proj_throw_time = torch.full(
-            (self.num_envs, N), float("-inf"), device=self.device
+            (self.num_physical_envs, N), float("-inf"), device=self.device
         )
-        self._proj_sim_time = torch.zeros(self.num_envs, device=self.device)
+        self._proj_sim_time = torch.zeros(self.num_physical_envs, device=self.device)
+
+        # Non-box shapes are only realized on backends that build per-slot primitive
+        # geometry. Elsewhere the colliders are boxes even though the obs still reports
+        # the configured shape -- warn so the physics/obs mismatch is not silent.
+        shapes = getattr(self._proj_config, "shapes", ("box",))
+        if not self._supports_mixed_projectile_shapes and any(
+            s != "box" for s in shapes
+        ):
+            logging.getLogger(__name__).warning(
+                "ProjectileConfig.shapes=%s requested but this simulator backend only "
+                "creates box projectile geometry; collision-primitive observations will "
+                "not match the physical shape. Mixed shapes are supported on IsaacLab.",
+                shapes,
+            )
 
         self._create_projectiles(self._proj_config)
         self._hide_all_projectiles()
 
-    def _throw_projectile(self) -> None:
-        """J-key handler: launch next projectile cube at each robot.
+    def _throw_projectile(self, env_ids: Optional[torch.Tensor] = None) -> None:
+        """Launch the next projectile at the robot in the given envs.
 
-        Follows ASE humanoid_perturb.py logic:
+        Used by both the J-key handler (all envs) and the auto-throw curriculum
+        (a stochastic per-env subset). Follows ASE humanoid_perturb.py logic:
         1. Spawn at random angle/distance around robot, height relative to root
         2. Aim at robot root with small Gaussian noise on all 3 direction components
         3. Lead the target by adding robot XY velocity to launch velocity
+
+        The pool slot is chosen randomly (each slot has a fixed primitive shape, so
+        this randomizes the thrown shape) and the projectile is launched with a random
+        orientation and mild tumble.
+
+        Args:
+            env_ids: Environments to throw in. None == all environments.
         """
         cfg = self._proj_config
-        all_env_ids = torch.arange(self.num_envs, device=self.device)
-        cube_idx = self._proj_next_idx.clone()
+        if env_ids is None:
+            env_ids = torch.arange(self.num_physical_envs, device=self.device)
+        if env_ids.numel() == 0:
+            return
+        num_e = env_ids.numel()
+        # Pick a pool slot per env. Each slot has a fixed primitive shape, so a random
+        # slot randomizes the thrown shape. Prefer currently-inactive (free) slots so
+        # an in-flight projectile isn't cut short; fall back to a random active slot.
+        throw_time = self._proj_throw_time[env_ids]  # [num_e, N], -inf == free
+        free = ~torch.isfinite(throw_time)
+        score = (
+            torch.rand(num_e, cfg.num_projectiles, device=self.device)
+            + 2.0 * free.to(torch.float32)
+        )
+        cube_idx = score.argmax(dim=1)
 
+        # env_ids index physical scenes. Aim each projectile at character 0 of its
+        # scene (row = phys * N); for N == 1 this is the env's only character.
         robot_state = self._get_simulator_root_state()
-        robot_pos = robot_state.root_pos  # [num_envs, 3]
+        char0_rows = env_ids * self.num_characters
+        robot_pos = robot_state.root_pos[char0_rows]  # [num_e, 3]
+        robot_vel = robot_state.root_vel[char0_rows]
 
         # Random spawn in polar coords around robot
-        angle = torch.rand(self.num_envs, device=self.device) * 2 * math.pi
+        angle = torch.rand(num_e, device=self.device) * 2 * math.pi
         dist_min, dist_max = cfg.spawn_distance_range
         distance = (
-            torch.rand(self.num_envs, device=self.device) * (dist_max - dist_min)
-            + dist_min
+            torch.rand(num_e, device=self.device) * (dist_max - dist_min) + dist_min
         )
         h_min, h_max = cfg.spawn_height_range
-        height_offset = (
-            torch.rand(self.num_envs, device=self.device) * (h_max - h_min) + h_min
-        )
+        height_offset = torch.rand(num_e, device=self.device) * (h_max - h_min) + h_min
 
         spawn_pos = robot_pos.clone()
         spawn_pos[:, 0] += torch.cos(angle) * distance
@@ -462,25 +516,89 @@ class Simulator(RecordingMixin, ABC):
         launch_dir = launch_dir / (torch.norm(launch_dir, dim=-1, keepdim=True) + 1e-8)
         speed_min, speed_max = cfg.speed_range
         speed = (
-            torch.rand(self.num_envs, 1, device=self.device) * (speed_max - speed_min)
+            torch.rand(num_e, 1, device=self.device) * (speed_max - speed_min)
             + speed_min
         )
         velocity = launch_dir * speed
 
         # Lead the target: add robot XY velocity to projectile velocity
-        velocity[:, 0:2] += robot_state.root_vel[:, 0:2]
+        velocity[:, 0:2] += robot_vel[:, 0:2]
 
-        rotation = torch.zeros(self.num_envs, 4, device=self.device)
-        rotation[:, 3] = 1.0  # identity quaternion xyzw
-        ang_vel = torch.zeros(self.num_envs, 3, device=self.device)
+        # Randomized orientation: a normalized 4D Gaussian is uniform on the 3-sphere,
+        # i.e. a uniform random rotation (xyzw). Add a mild random tumble so
+        # non-spherical shapes present varied faces on impact.
+        rotation = torch.randn(num_e, 4, device=self.device)
+        rotation = rotation / (torch.norm(rotation, dim=-1, keepdim=True) + 1e-8)
+        ang_vel = torch.randn(num_e, 3, device=self.device) * 4.0
 
         self._set_projectile_root_states(
-            cube_idx, spawn_pos, rotation, velocity, ang_vel, all_env_ids
+            cube_idx, spawn_pos, rotation, velocity, ang_vel, env_ids
         )
 
-        self._proj_throw_time[all_env_ids, cube_idx] = self._proj_sim_time
-        self._proj_next_idx = (cube_idx + 1) % cfg.num_projectiles
-        log.info("Projectile thrown (cube indices: %s...)", cube_idx[:4].tolist())
+        self._proj_throw_time[env_ids, cube_idx] = self._proj_sim_time[env_ids]
+        self._proj_next_idx[env_ids] = (cube_idx + 1) % cfg.num_projectiles
+
+    def _auto_throw_projectiles(self) -> None:
+        """Stochastic per-env auto-throw during training (Tier-2 curriculum)."""
+        cfg = self._proj_config
+        if not getattr(cfg, "auto_throw_enabled", False) or cfg.auto_throw_prob <= 0.0:
+            return
+        throw_mask = (
+            torch.rand(self.num_physical_envs, device=self.device)
+            < cfg.auto_throw_prob
+        )
+        env_ids = torch.nonzero(throw_mask, as_tuple=False).flatten()
+        if env_ids.numel() > 0:
+            self._throw_projectile(env_ids)
+
+    @property
+    def num_projectiles(self) -> int:
+        """Number of projectiles in the pool."""
+        return self._proj_config.num_projectiles
+
+    def get_active_projectile_states(self) -> Dict[str, torch.Tensor]:
+        """Return projectile poses and an active mask for collision-primitive obs.
+
+        Velocity is intentionally NOT returned (not all backends expose it cheaply);
+        the environment derives it via finite difference on positions.
+
+        Returns:
+            Dict with:
+                positions: [num_envs, num_projectiles, 3]
+                rotations: [num_envs, num_projectiles, 4] (xyzw)
+                active:    [num_envs, num_projectiles] float (1.0 == thrown & not expired)
+                half_sizes:[num_projectiles] cube half-extents (per pool index)
+                radius:    [num_projectiles] sphere/capsule radius (0 for box)
+                extent_z:  [num_projectiles] box full height / capsule length (0 sphere)
+                shape:     [num_projectiles, 2] one-hot [is_box, is_sphere] (capsule=[0,0])
+        """
+        positions, rotations = self._get_projectile_positions_rotations()
+        active = (self._proj_throw_time > float("-inf")).to(positions.dtype)
+        half_sizes = torch.tensor(
+            self._proj_config.get_sizes(), device=self.device, dtype=positions.dtype
+        )
+        # Per-pool-index shape encoding (matches the collision_primitives obs layout).
+        specs = self._proj_config.get_shape_specs()
+        radius = torch.tensor(
+            [s.radius for s in specs], device=self.device, dtype=positions.dtype
+        )
+        extent_z = torch.tensor(
+            [s.extent_z for s in specs], device=self.device, dtype=positions.dtype
+        )
+        shape = torch.tensor(
+            [list(s.shape_onehot) for s in specs],
+            device=self.device,
+            dtype=positions.dtype,
+        )
+        return {
+            "positions": positions,
+            "rotations": rotations,
+            "active": active,
+            "half_sizes": half_sizes,
+            "radius": radius,
+            "extent_z": extent_z,
+            "shape": shape,
+        }
 
     def _update_projectiles(self) -> None:
         """Timer-based hiding of expired projectiles."""
@@ -513,7 +631,7 @@ class Simulator(RecordingMixin, ABC):
 
     def _hide_all_projectiles(self) -> None:
         """Move all projectiles underground."""
-        all_env_ids = torch.arange(self.num_envs, device=self.device)
+        all_env_ids = torch.arange(self.num_physical_envs, device=self.device)
         self._hide_projectiles_for_envs(all_env_ids)
 
     def _hide_projectiles_for_envs(self, env_ids: torch.Tensor) -> None:
@@ -618,6 +736,8 @@ class Simulator(RecordingMixin, ABC):
         self,
         common_actions: torch.Tensor,
         markers_callback: Optional[Callable[[], Dict[str, MarkerState]]] = None,
+        stiffness: Optional[torch.Tensor] = None,
+        damping: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Perform a simulation step by:
@@ -630,6 +750,12 @@ class Simulator(RecordingMixin, ABC):
             common_actions (torch.Tensor): Action tensor in common format.
             markers_callback (Callable): Optional callback function that returns marker states.
                                         Called after physics step but before rendering.
+            stiffness (torch.Tensor): Optional per-step PD stiffness gains in common
+                DOF ordering, broadcastable to [num_envs, num_actions]. Only used by
+                ``ControlType.PROPORTIONAL``; ignored by BUILT_IN_PD/TORQUE. When
+                ``None`` the static config gains (``_common_p_gains``) are used. This
+                is the runtime hook used by the "stamina" feature to weaken joint drive.
+            damping (torch.Tensor): Optional per-step PD damping gains (see ``stiffness``).
         """
         # Store the action history (two-step buffer for acceleration clamp)
         self._prev_prev_actions = self._previous_actions.clone()
@@ -637,9 +763,18 @@ class Simulator(RecordingMixin, ABC):
         self.user_requested_reset = False
         self._common_actions = common_actions.to(self.device)
 
+        # Runtime per-env / per-DOF PD gains (PROPORTIONAL control only). Stored on
+        # self so they persist across the decimation substeps in _physics_step().
+        self._runtime_p_gains = stiffness.to(self.device) if stiffness is not None else None
+        self._runtime_d_gains = damping.to(self.device) if damping is not None else None
+
         # Apply PD target acceleration clamp (limits oscillatory jerk)
         if self.config.pd_target_max_accel is not None:
             self._apply_accel_clamp()
+
+        # Stochastic per-env auto-throw (Tier-2 curriculum). Sets projectile root
+        # states before the physics step so the throw integrates this step.
+        self._auto_throw_projectiles()
 
         self._steps_since_reset += 1
         self._physics_step()
@@ -658,6 +793,44 @@ class Simulator(RecordingMixin, ABC):
         self._update_markers(markers_state)
 
         self.render()
+
+    def set_joint_gain_scale(
+        self, scale: torch.Tensor, env_ids: Optional[torch.Tensor] = None
+    ) -> None:
+        """Scale per-DOF PD gains at runtime for the given environments.
+
+        ``scale`` multiplies the nominal stiffness AND damping
+        (``_common_p_gains`` / ``_common_d_gains``) of every DOF, in common DOF
+        ordering, shape ``[len(env_ids), num_actions]`` (or
+        ``[num_envs, num_actions]`` when ``env_ids`` is None). This is the
+        ``BUILT_IN_PD`` analogue of the PROPORTIONAL stamina hook
+        (``step(stiffness=, damping=)``): rather than overriding per-step gains
+        (which BUILT_IN_PD ignores), it writes the resulting gains into the
+        physics engine so the change is physically effective. It is meant to be
+        called on reset (per-episode), not every step.
+
+        The base implementation is a no-op (with a one-time warning); only
+        backends that support runtime gain writes override it. Where
+        unsupported, "stamina" remains observable but has no physical effect.
+        """
+        if not getattr(self, "_gain_scale_unsupported_warned", False):
+            log.warning(
+                "set_joint_gain_scale is not implemented for %s; runtime "
+                "joint-gain scaling (stamina) will have no physical effect on "
+                "this backend.",
+                type(self).__name__,
+            )
+            self._gain_scale_unsupported_warned = True
+
+    def get_robot_body_masses(self) -> torch.Tensor:
+        """Return per-row body masses in common body order.
+
+        Backends without a runtime mass query use a neutral 1 kg fallback. Mass is
+        selection metadata only and does not alter physics.
+        """
+        return torch.ones(
+            self.num_envs, self._num_bodies, device=self.device, dtype=torch.float
+        )
 
     def reset_envs(
         self,
@@ -690,8 +863,13 @@ class Simulator(RecordingMixin, ABC):
             self._simulation_time[env_ids] = 0.0
             self._schedule_push(env_ids)
 
-        # Reset projectiles for reset environments
-        self._reset_projectiles(env_ids)
+        # Reset projectiles for reset environments. Projectiles are per physical
+        # scene, so collapse the character rows being reset to their physical scenes.
+        if self.num_characters > 1:
+            phys_ids = torch.unique(env_ids // self.num_characters)
+        else:
+            phys_ids = env_ids
+        self._reset_projectiles(phys_ids)
 
     @abstractmethod
     def _set_simulator_env_state(
@@ -1163,9 +1341,21 @@ class Simulator(RecordingMixin, ABC):
             common_dof_state = self._get_simulator_dof_state().convert_to_common(
                 self.data_conversion
             )
+            # Use runtime gains (e.g. stamina-scaled, per-env/per-DOF) when provided,
+            # otherwise fall back to the static config gains.
+            p_gains = (
+                self._runtime_p_gains
+                if self._runtime_p_gains is not None
+                else self._common_p_gains
+            )
+            d_gains = (
+                self._runtime_d_gains
+                if self._runtime_d_gains is not None
+                else self._common_d_gains
+            )
             torques = (
-                self._common_p_gains * (targets - common_dof_state.dof_pos)
-                - self._common_d_gains * common_dof_state.dof_vel
+                p_gains * (targets - common_dof_state.dof_pos)
+                - d_gains * common_dof_state.dof_vel
             )
             torques = torch.clip(
                 torques, -self._torque_limits_common, self._torque_limits_common
@@ -1242,6 +1432,11 @@ class Simulator(RecordingMixin, ABC):
         self._common_p_gains = p_gains
         self._common_d_gains = d_gains
         self._torque_limits_common = dof_effort_limits
+
+        # Optional per-step runtime gain overrides (set in step()). None => use the
+        # static gains above. Populated by the stamina feature via env.step().
+        self._runtime_p_gains: Optional[torch.Tensor] = None
+        self._runtime_d_gains: Optional[torch.Tensor] = None
 
     def _process_domain_randomization(self) -> None:
         """

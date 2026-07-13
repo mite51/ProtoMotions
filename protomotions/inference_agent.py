@@ -54,6 +54,25 @@ During inference, these controls are available:
 - **L**: Start/stop video recording
 - **Q**: Quit
 
+Fighting-mimic interference (robustness testing)
+------------------------------------------------
+
+For fighting-mimic checkpoints, two flags re-enable training-time interference so
+you can watch the policy cope with it live (both are no-ops on models without the
+projectile pool / stamina bodies):
+
+- ``--throw`` (optionally ``--auto-throw-prob P``): stochastically throw projectiles
+  at the character each step. Auto-creates a projectile pool if the checkpoint has
+  none (e.g. the Tier-1 base).
+- ``--randomize-stamina`` (optionally ``--stamina-range LO HI``): randomize each
+  body's joint-stiffness scale per episode (BUILT_IN_PD gains written on reset).
+
+Example::
+
+    PYTHON_PATH protomotions/inference_agent.py --simulator isaaclab --num-envs 16 \\
+        --checkpoint results/smpl_fight_multichar/last.ckpt \\
+        --throw --auto-throw-prob 0.05 --randomize-stamina --stamina-range 0.1 2.0
+
 Example
 -------
 >>> # Test with custom settings
@@ -114,6 +133,49 @@ def create_parser():
         nargs="*",
         default=[],
         help="Config overrides in format key=value (e.g., env.max_episode_length=5000 simulator.headless=True)",
+    )
+
+    # --- Fighting-mimic robustness toggles (interference at inference time) -------
+    parser.add_argument(
+        "--throw",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable stochastic auto-throwing of projectiles at the character "
+            "(the Tier-2 'thrown colliders' interference). Uses --auto-throw-prob, "
+            "or 0.05 if that is not given. The 'J' key also throws manually."
+        ),
+    )
+    parser.add_argument(
+        "--auto-throw-prob",
+        type=float,
+        default=None,
+        help=(
+            "Per-env, per-step probability of auto-throwing a projectile. Implies "
+            "--throw. Training used ~0.01; try 0.02-0.1 to see interference more "
+            "often during inference."
+        ),
+    )
+    parser.add_argument(
+        "--randomize-stamina",
+        action="store_true",
+        default=False,
+        help=(
+            "Randomize per-body stamina (the joint-stiffness scale) each episode, "
+            "so joints are weaker/stiffer/uneven. Uses --stamina-range, or the "
+            "checkpoint's configured range if that is not given."
+        ),
+    )
+    parser.add_argument(
+        "--stamina-range",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("LO", "HI"),
+        help=(
+            "Range to sample per-body stamina from (implies --randomize-stamina). "
+            "1.0 == nominal gains; the fight tier trained on 0.1 2.0."
+        ),
     )
 
     return parser
@@ -252,6 +314,33 @@ def main():
     if args.headless is not None:
         log.info(f"CLI override: headless = {args.headless}")
         simulator_config.headless = args.headless
+
+    # Fighting-mimic interference toggles. Applied before the generic --overrides
+    # block (so an explicit --overrides key still wins) and before the simulator /
+    # env are built, which is required: the projectile pool is allocated at build
+    # time, and stamina bodies must exist before the env resets.
+    if args.throw or args.auto_throw_prob is not None:
+        from protomotions.simulator.base_simulator.config import ProjectileConfig
+
+        prob = args.auto_throw_prob if args.auto_throw_prob is not None else 0.05
+        if simulator_config.projectile is None:
+            # Checkpoint has no projectile pool baked in (e.g. Tier-1 base): create
+            # one with the gentler fight defaults so cubes exist to throw.
+            simulator_config.projectile = ProjectileConfig(
+                speed_range=(12.0, 22.0), density=300.0
+            )
+        simulator_config.projectile.auto_throw_enabled = True
+        simulator_config.projectile.auto_throw_prob = prob
+        log.info(f"CLI override: auto-throw projectiles enabled (prob={prob})")
+
+    if args.randomize_stamina or args.stamina_range is not None:
+        env_config.randomize_body_stamina = True
+        if args.stamina_range is not None:
+            env_config.body_stamina_range = tuple(args.stamina_range)
+        log.info(
+            "CLI override: body-stamina randomization enabled, range="
+            f"{tuple(env_config.body_stamina_range)}"
+        )
 
     # Parse and apply general CLI overrides
     from protomotions.utils.config_utils import (

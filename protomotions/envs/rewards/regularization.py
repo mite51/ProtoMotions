@@ -260,6 +260,53 @@ def impact_force_penalty(
     return force_changes.sum(dim=-1)
 
 
+def compute_body_impact_penalty(
+    current_contact_force_magnitudes: Tensor,
+    incoming_damage: Tensor,
+    body_indices: Tensor,
+    threshold: float = 50.0,
+) -> Tensor:
+    """Penalty for taking high-force impacts on vulnerable body parts.
+
+    Sums contact force above ``threshold`` over the given body subset (intended to
+    EXCLUDE hands and feet, which legitimately absorb large forces while moving or
+    striking), then scales by the per-env incoming threat ``incoming_damage``. With
+    damage 0 (e.g. only ground/baseline colliders) the penalty vanishes, so the
+    policy is pushed to avoid/brace dangerous impacts specifically -- not all contact.
+
+    Args:
+        current_contact_force_magnitudes: Per-body contact force magnitudes
+            [num_envs, num_bodies].
+        incoming_damage: Per-env threat scalar [num_envs] (e.g. max damage among
+            active incoming colliders).
+        body_indices: Indices of vulnerable bodies to penalize (hands/feet excluded).
+        threshold: Force magnitude below which impacts are ignored.
+
+    Returns:
+        Per-env penalty magnitude [num_envs] (apply a negative weight in the factory).
+    """
+    forces = current_contact_force_magnitudes[:, body_indices]
+    excess = torch.clamp(forces - threshold, min=0.0)
+    return excess.sum(dim=-1) * incoming_damage
+
+
+def compute_opponent_impact_reward(opponent_impact: Tensor) -> Tensor:
+    """Reward for striking opponents with fast-moving limbs (multi-character).
+
+    ``opponent_impact`` is precomputed by the environment as the maximum closing
+    speed (m/s) of any of the character's striking bodies (hands/feet) toward any
+    opponent key body within strike range, per character row [num_envs]. With a
+    single character this is identically zero. Apply a positive weight in the factory.
+
+    Args:
+        opponent_impact: Per-character striking signal [num_envs].
+
+    Returns:
+        Per-character reward [num_envs].
+    """
+    return opponent_impact
+
+
 __all__ = [
     # Main reward kernels
     "compute_action_smoothness",
@@ -268,6 +315,8 @@ __all__ = [
     "compute_soft_pos_limit_rew",
     "compute_contact_match_rew",
     "compute_contact_force_change_rew",
+    "compute_body_impact_penalty",
+    "compute_opponent_impact_reward",
     # Helper functions
     "joint_limit_violation",
     "contact_mismatch_sum",

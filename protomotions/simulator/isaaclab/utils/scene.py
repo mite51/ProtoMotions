@@ -107,30 +107,44 @@ class SceneCfg(InteractiveSceneCfg):
                     )
                     setattr(self, f"object_{obj_idx}_contact_sensor", object_sensor_cfg)
 
-        # Projectile rigid objects (always created, independent of scene objects)
+        # Projectile rigid objects (always created, independent of scene objects).
+        # Each pool index gets a primitive shape (box/sphere/capsule) from the config;
+        # only the spawn geometry differs, all share the same physics/visual props.
         if projectile_config is not None:
-            proj_sizes = projectile_config.get_sizes()
+            proj_specs = projectile_config.get_shape_specs()
+            shared_props = dict(
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                    kinematic_enabled=False,
+                    enable_gyroscopic_forces=True,
+                ),
+                mass_props=sim_utils.MassPropertiesCfg(
+                    density=projectile_config.density
+                ),
+                collision_props=sim_utils.CollisionPropertiesCfg(
+                    contact_offset=0.02,
+                    rest_offset=0.0,
+                ),
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(0.8, 0.1, 0.1)
+                ),
+            )
             for proj_idx in range(projectile_config.num_projectiles):
-                s = proj_sizes[proj_idx]
+                spec = proj_specs[proj_idx]
+                if spec.shape_type == "sphere":
+                    spawn_cfg = sim_utils.SphereCfg(radius=spec.radius, **shared_props)
+                elif spec.shape_type == "capsule":
+                    # extent_z is the capsule cylinder length; default axis is Z.
+                    spawn_cfg = sim_utils.CapsuleCfg(
+                        radius=spec.radius, height=spec.extent_z, **shared_props
+                    )
+                else:  # "box"
+                    spawn_cfg = sim_utils.CuboidCfg(
+                        size=(spec.extent_z, spec.extent_z, spec.extent_z),
+                        **shared_props,
+                    )
                 proj_cfg = RigidObjectCfg(
                     prim_path=f"/World/envs/env_.*/Projectile_{proj_idx}",
-                    spawn=sim_utils.CuboidCfg(
-                        size=(s * 2, s * 2, s * 2),
-                        rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                            kinematic_enabled=False,
-                            enable_gyroscopic_forces=True,
-                        ),
-                        mass_props=sim_utils.MassPropertiesCfg(
-                            density=projectile_config.density
-                        ),
-                        collision_props=sim_utils.CollisionPropertiesCfg(
-                            contact_offset=0.02,
-                            rest_offset=0.0,
-                        ),
-                        visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=(0.8, 0.1, 0.1)
-                        ),
-                    ),
+                    spawn=spawn_cfg,
                     init_state=RigidObjectCfg.InitialStateCfg(
                         pos=(0.0, 0.0, projectile_config.hide_z)
                     ),
@@ -166,62 +180,101 @@ class SceneCfg(InteractiveSceneCfg):
                 },
             )
 
-        # articulation
-        self.robot = ArticulationCfg(
-            prim_path="/World/envs/env_.*/Robot",
-            spawn=sim_utils.UsdFileCfg(
-                usd_path=f"{robot_config.asset.asset_root}/{robot_config.asset.usd_asset_file_name}",
-                activate_contact_sensors=activate_contact_sensors,
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    disable_gravity=robot_config.asset.disable_gravity,
-                    retain_accelerations=False,
-                    linear_damping=robot_config.asset.linear_damping,
-                    angular_damping=robot_config.asset.angular_damping,
-                    max_linear_velocity=robot_config.asset.max_linear_velocity,
-                    max_angular_velocity=robot_config.asset.max_angular_velocity,
-                    max_depenetration_velocity=config.sim.physx.max_depenetration_velocity,
-                ),
-                articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                    enabled_self_collisions=robot_config.asset.self_collisions,
-                    solver_position_iteration_count=config.sim.physx.num_position_iterations,
-                    solver_velocity_iteration_count=config.sim.physx.num_velocity_iterations,
-                ),
-                collision_props=sim_utils.CollisionPropertiesCfg(
-                    contact_offset=config.sim.physx.contact_offset,
-                    rest_offset=config.sim.physx.rest_offset,
-                ),
-                visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=(0.9, 0.9, 0.9), metallic=0.5
-                ),
-            ),
-            init_state=ArticulationCfg.InitialStateCfg(
-                pos=(0.0, 0.0, robot_config.default_root_height),
-                joint_pos={".*": 0.0},
-                joint_vel={".*": 0.0},
-            ),
-            actuators=actuators,
+        # articulation(s). For multi-character self-play (num_characters > 1) we spawn
+        # N identical articulations per env (Robot_0..Robot_{N-1}) that physically
+        # interact within the scene. For N == 1 we keep the legacy prim name "Robot"
+        # and attribute "robot" so single-character behavior is byte-for-byte identical.
+        from protomotions.simulator.base_simulator.utils import (
+            character_spawn_offsets,
         )
 
-        # Apply disable_gravity setting for all robot types if specified
-        if (
-            hasattr(robot_config.asset, "disable_gravity")
-            and robot_config.asset.disable_gravity
-        ):
-            # Only modify disable_gravity field, keeping all other settings
-            new_rigid_props = self.robot.spawn.rigid_props.replace(disable_gravity=True)
-            self.robot.spawn = self.robot.spawn.replace(rigid_props=new_rigid_props)
+        num_characters = getattr(config, "num_characters", 1)
+        spawn_offsets = character_spawn_offsets(
+            num_characters, getattr(config, "character_spawn_radius", 1.0)
+        )
 
-        if activate_contact_sensors:
-            sensing_filter = ["/World/ground/terrain/mesh"]
-            for obj_idx in range(num_objects_per_scene):
-                sensing_filter.append(f"/World/envs/env_.*/Object_{obj_idx}")
-            for body_name in robot_config.contact_bodies:
-                contact_sensor_cfg = ContactSensorCfg(
-                    prim_path=f"{robot_config.asset.usd_bodies_root_prim_path}{body_name}",
-                    filter_prim_paths_expr=sensing_filter,
-                    history_length=config.sim.decimation,
+        def _robot_name(idx: int) -> str:
+            return "Robot" if num_characters == 1 else f"Robot_{idx}"
+
+        def _attr_name(idx: int) -> str:
+            return "robot" if num_characters == 1 else f"robot_{idx}"
+
+        for char_idx in range(num_characters):
+            robot_name = _robot_name(char_idx)
+            offset_x, offset_y = spawn_offsets[char_idx]
+            robot_cfg = ArticulationCfg(
+                prim_path=f"/World/envs/env_.*/{robot_name}",
+                spawn=sim_utils.UsdFileCfg(
+                    usd_path=f"{robot_config.asset.asset_root}/{robot_config.asset.usd_asset_file_name}",
+                    activate_contact_sensors=activate_contact_sensors,
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                        disable_gravity=robot_config.asset.disable_gravity,
+                        retain_accelerations=False,
+                        linear_damping=robot_config.asset.linear_damping,
+                        angular_damping=robot_config.asset.angular_damping,
+                        max_linear_velocity=robot_config.asset.max_linear_velocity,
+                        max_angular_velocity=robot_config.asset.max_angular_velocity,
+                        max_depenetration_velocity=config.sim.physx.max_depenetration_velocity,
+                    ),
+                    articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                        enabled_self_collisions=robot_config.asset.self_collisions,
+                        solver_position_iteration_count=config.sim.physx.num_position_iterations,
+                        solver_velocity_iteration_count=config.sim.physx.num_velocity_iterations,
+                    ),
+                    collision_props=sim_utils.CollisionPropertiesCfg(
+                        contact_offset=config.sim.physx.contact_offset,
+                        rest_offset=config.sim.physx.rest_offset,
+                    ),
+                    visual_material=sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=(0.9, 0.9, 0.9), metallic=0.5
+                    ),
+                ),
+                init_state=ArticulationCfg.InitialStateCfg(
+                    pos=(offset_x, offset_y, robot_config.default_root_height),
+                    joint_pos={".*": 0.0},
+                    joint_vel={".*": 0.0},
+                ),
+                actuators=actuators,
+            )
+
+            # Apply disable_gravity setting for all robot types if specified
+            if (
+                hasattr(robot_config.asset, "disable_gravity")
+                and robot_config.asset.disable_gravity
+            ):
+                # Only modify disable_gravity field, keeping all other settings
+                new_rigid_props = robot_cfg.spawn.rigid_props.replace(
+                    disable_gravity=True
                 )
-                setattr(self, f"contact_sensor_{body_name}", contact_sensor_cfg)
+                robot_cfg.spawn = robot_cfg.spawn.replace(rigid_props=new_rigid_props)
+
+            setattr(self, _attr_name(char_idx), robot_cfg)
+
+            if activate_contact_sensors:
+                sensing_filter = ["/World/ground/terrain/mesh"]
+                for obj_idx in range(num_objects_per_scene):
+                    sensing_filter.append(f"/World/envs/env_.*/Object_{obj_idx}")
+                # Body prim root for this character: substitute the robot name into
+                # the configured "/Robot/" path. Inter-character contact forces are
+                # captured by net_forces_w regardless of the filter list, so we do
+                # not add other characters to the filter (opponent-impact reward is
+                # computed geometrically, not via contact-object resolution).
+                base_path = robot_config.asset.usd_bodies_root_prim_path
+                if num_characters > 1:
+                    base_path = base_path.replace("/Robot/", f"/{robot_name}/")
+                for body_name in robot_config.contact_bodies:
+                    contact_sensor_cfg = ContactSensorCfg(
+                        prim_path=f"{base_path}{body_name}",
+                        filter_prim_paths_expr=sensing_filter,
+                        history_length=config.sim.decimation,
+                    )
+                    if num_characters == 1:
+                        sensor_attr = f"contact_sensor_{body_name}"
+                    else:
+                        sensor_attr = (
+                            f"contact_sensor_{_attr_name(char_idx)}_{body_name}"
+                        )
+                    setattr(self, sensor_attr, contact_sensor_cfg)
 
         if terrain is not None:
             terrain_physics_material = sim_utils.RigidBodyMaterialCfg(

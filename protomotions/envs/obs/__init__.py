@@ -76,6 +76,15 @@ from protomotions.envs.obs.steering import compute_steering_obs
 # Path observation compute kernel
 from protomotions.envs.obs.path import compute_path_obs
 
+# Collision-primitive observation compute kernel
+from protomotions.envs.obs.collision_primitives import (
+    compute_collision_primitives_obs,
+    PRIMITIVE_FEATURE_DIM,
+)
+
+# Per-body stamina observation compute kernel
+from protomotions.envs.obs.stamina import compute_stamina_obs
+
 # Observation noise utilities
 from protomotions.envs.obs.observation_noise import (
     NoisyObservations,
@@ -124,6 +133,11 @@ __all__ = [
     "compute_steering_obs",
     # Path observation compute kernel
     "compute_path_obs",
+    # Collision-primitive observation compute kernel
+    "compute_collision_primitives_obs",
+    "PRIMITIVE_FEATURE_DIM",
+    # Per-body stamina observation compute kernel
+    "compute_stamina_obs",
     # Observation noise utilities
     "NoisyObservations",
     "apply_observation_noise",
