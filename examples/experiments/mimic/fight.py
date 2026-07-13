@@ -28,9 +28,13 @@ observation architecture used across every fighting-game training tier:
     engine on reset (see ``BaseEnv._apply_body_stamina_to_gains`` ->
     ``Simulator.set_joint_gain_scale``). Inert (==1.0, i.e. nominal gains) until
     the stamina tier turns on randomization.
-  - per-step XY motion re-anchoring (``realign_motion_with_humanoid_on_each_step``)
-    so an unavoidable shove doesn't accumulate absolute-position tracking error;
-    pose shape, orientation, and relative locomotion are still tracked.
+  - smooth velocity-error XY motion re-anchoring
+    (``realign_motion_with_humanoid_on_each_step``) so an unavoidable shove doesn't
+    accumulate absolute-position tracking error; pose shape, orientation, and relative
+    locomotion are still tracked. The reference offset blends toward the character with
+    a strength proportional to the "unexpected" root XY velocity (character vs. clip),
+    so it stays stable when the character tracks the clip (e.g. getup) and only catches
+    up under an external shove/slide. See the deployment doc for the exact algorithm.
 
 In this Tier 1 base experiment the interference features are present but INERT:
 only the ground primitive is populated (no projectiles/opponents) and stamina
@@ -185,13 +189,21 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
         motion_manager=MimicMotionManagerConfig(
             init_start_prob=0.2,
             resample_on_reset=True,
-            # Conservative XY re-anchoring: each step the reference is shifted so its
-            # root XY coincides with the character's actual root (via
-            # respawn_root_offset). Relative motion (locomotion, pose shape, global
-            # orientation, velocities) is still tracked, but absolute XY drift caused
-            # by an unavoidable shove/impact is NOT penalized. Enabled from the Tier 1
-            # base so tracking semantics stay identical across every fighting tier.
+            # Smooth velocity-error XY re-anchoring: each step the reference XY offset
+            # is blended toward the character's actual root (via respawn_root_offset)
+            # with a strength proportional to the "unexpected" root XY velocity
+            # (character vs. clip). Absolute XY drift from an unavoidable shove/impact
+            # is NOT penalized, while pose shape, orientation, relative locomotion, and
+            # velocities are still tracked. Because the blend is gated on velocity
+            # mismatch, balance-critical clips (e.g. getup) that track the clip velocity
+            # leave the offset stable instead of chasing a moving target. Enabled from
+            # the Tier 1 base so tracking semantics stay identical across every tier.
             realign_motion_with_humanoid_on_each_step=True,
+            realign_alpha_min=0.0,
+            realign_alpha_max=0.4,
+            realign_vel_err_low=0.3,
+            realign_vel_err_high=1.5,
+            realign_max_xy_speed=2.0,
         ),
     )
 

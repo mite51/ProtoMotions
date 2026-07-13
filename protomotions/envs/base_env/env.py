@@ -100,6 +100,7 @@ from protomotions.envs.component_manager import ComponentManager
 from protomotions.envs.base_env.utils import (
     combine_rewards,
     combine_terminations,
+    compute_smooth_realign_offset,
 )
 from protomotions.components.pose_lib import compute_body_density_weights
 
@@ -766,6 +767,40 @@ class BaseEnv:
             root_pos[:, :2] - ref_state.rigid_body_pos[:, 0, :2]
         )
 
+    def update_smooth_motion_alignment(self, env_ids, dt: float):
+        """Smoothly re-anchor the reference XY offset toward the character.
+
+        Unlike ``align_motion_with_humanoid`` (an instant XY snap used at reset), this
+        blends ``respawn_root_offset`` toward the snap target with a strength
+        proportional to the "unexpected" root XY velocity (character vs. reference clip
+        velocity). See ``compute_smooth_realign_offset`` and the fighting-mimic
+        deployment doc for the exact contract.
+
+        Args:
+            env_ids: Environment indices to re-anchor.
+            dt: Control timestep (s), used to cap offset drift per step.
+        """
+        cfg = self.motion_manager.config
+        root_state = self.simulator.get_root_state(env_ids)
+        ref_state = self.motion_lib.get_motion_state(
+            self.motion_manager.motion_ids[env_ids],
+            self.motion_manager.motion_times[env_ids],
+        )
+
+        self.respawn_root_offset[env_ids, :2] = compute_smooth_realign_offset(
+            current_root_xy=root_state.root_pos[:, :2],
+            ref_root_xy=ref_state.rigid_body_pos[:, 0, :2],
+            current_root_xy_vel=root_state.root_vel[:, :2],
+            ref_root_xy_vel=ref_state.rigid_body_vel[:, 0, :2],
+            prev_offset_xy=self.respawn_root_offset[env_ids, :2],
+            alpha_min=cfg.realign_alpha_min,
+            alpha_max=cfg.realign_alpha_max,
+            vel_err_low=cfg.realign_vel_err_low,
+            vel_err_high=cfg.realign_vel_err_high,
+            max_xy_speed=cfg.realign_max_xy_speed,
+            dt=dt,
+        )
+
     def get_spawn_to_ref_pose_offset_with_terrain_height_correction(
         self, target_pos: Tensor, env_ids: Optional[Tensor] = None
     ) -> Tensor:
@@ -973,11 +1008,15 @@ class BaseEnv:
             self.motion_manager is not None
             and self.motion_manager.config.realign_motion_with_humanoid_on_each_step
         ):
-            # When realign_motion_with_humanoid_on_each_step is True, we re-align before computing observations and rewards.
-            # This ensures the robot only matches the local-pose with global orientation.
-            self.align_motion_with_humanoid(
+            # Re-anchor the reference XY before computing observations and rewards so the
+            # robot only has to match local pose + global orientation, not absolute XY.
+            # Uses smooth velocity-error re-anchoring: the offset blends toward the
+            # character only as fast as an unexpected shove/slide warrants, leaving it
+            # stable when the character tracks the clip velocity (e.g. getup). Reset
+            # still snaps the offset instantly (see update_respawn_root_offset_by_env_ids).
+            self.update_smooth_motion_alignment(
                 torch.arange(self.num_envs, device=self.device, dtype=torch.long),
-                self.simulator.get_root_state().root_pos,
+                dt=self.simulator.dt,
             )
 
         # Build context once and reuse for observations, rewards, and terminations

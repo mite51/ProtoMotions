@@ -39,6 +39,71 @@ logger = logging.getLogger(__name__)
 _reward_sanitize_warn_count = 0
 
 
+# =============================================================================
+# Motion Re-Anchoring
+# =============================================================================
+
+
+def compute_smooth_realign_offset(
+    current_root_xy: Tensor,
+    ref_root_xy: Tensor,
+    current_root_xy_vel: Tensor,
+    ref_root_xy_vel: Tensor,
+    prev_offset_xy: Tensor,
+    alpha_min: float,
+    alpha_max: float,
+    vel_err_low: float,
+    vel_err_high: float,
+    max_xy_speed: float,
+    dt: float,
+    eps: float = 1e-8,
+) -> Tensor:
+    """Smooth velocity-error reference re-anchoring (XY only).
+
+    Blends the persisted reference XY offset toward the instant-snap target with a
+    strength proportional to the "unexpected" root XY velocity (the mismatch between
+    the character's velocity and the reference clip's velocity). A character that
+    tracks the clip velocity leaves the offset stable (important for balance-critical
+    clips such as getup); an external shove/slide produces velocity mismatch and pulls
+    the reference toward the character so it stays reachable.
+
+    Args:
+        current_root_xy: Character root XY [N, 2].
+        ref_root_xy: Reference clip root XY at the current playback time [N, 2].
+        current_root_xy_vel: Character root XY velocity [N, 2].
+        ref_root_xy_vel: Reference clip root XY velocity [N, 2].
+        prev_offset_xy: Current persisted reference XY offset [N, 2].
+        alpha_min: Blend factor at/below ``vel_err_low``.
+        alpha_max: Blend factor at/above ``vel_err_high``.
+        vel_err_low: Velocity error (m/s) below which ``alpha_min`` is used.
+        vel_err_high: Velocity error (m/s) at/above which ``alpha_max`` is used.
+        max_xy_speed: Cap (m/s) on offset change magnitude per step.
+        dt: Control timestep (s), used with ``max_xy_speed`` to cap offset drift.
+        eps: Numerical-stability epsilon.
+
+    Returns:
+        The new reference XY offset [N, 2].
+    """
+    # Instant-snap target: what the reference offset would be to co-locate roots.
+    target_xy = current_root_xy - ref_root_xy
+
+    # Unexpected root XY velocity -> smoothstep -> blend factor alpha.
+    vel_err = torch.linalg.norm(current_root_xy_vel - ref_root_xy_vel, dim=-1)
+    denom = max(vel_err_high - vel_err_low, eps)
+    t = torch.clamp((vel_err - vel_err_low) / denom, 0.0, 1.0)
+    t = t * t * (3.0 - 2.0 * t)
+    alpha = alpha_min + (alpha_max - alpha_min) * t
+
+    new_xy = prev_offset_xy + alpha.unsqueeze(-1) * (target_xy - prev_offset_xy)
+
+    # Cap how fast the offset may move per step.
+    delta = new_xy - prev_offset_xy
+    max_delta = max_xy_speed * dt
+    delta_norm = torch.linalg.norm(delta, dim=-1, keepdim=True)
+    scale = torch.clamp(max_delta / delta_norm.clamp_min(eps), max=1.0)
+    return prev_offset_xy + delta * scale
+
+
 
 
 # =============================================================================

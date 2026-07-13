@@ -27,7 +27,7 @@ and timing below, the same `.onnx` will drive it identically to ProtoMotions.
 | Ground sensing | root-height / terrain obs | **`collision_primitives`** — unified egocentric encoding of ground + obstacles + projectiles + (later) opponents |
 | Contacts | usually off | **`observe_contacts=True`** on a frozen body set |
 | Per-limb strength | n/a | **`stamina_obs`** = per-body joint-stiffness scale; the engine's per-joint gains are set to `nominal * stamina` |
-| Reference tracking | world-anchored | **per-step XY re-anchoring** (shoves don't accumulate absolute-position error) |
+| Reference tracking | world-anchored | **smooth velocity-error XY re-anchoring** (shoves don't accumulate absolute-position error; a stable-tracking clip like getup leaves the anchor put) |
 | Action outputs | joint position targets | joint position targets (same contract; gains live in the engine, not the action output) |
 
 Experiment files: `examples/experiments/mimic/fight.py` (Tier 1 base, defines the
@@ -150,16 +150,96 @@ velocity by finite difference — see `BaseEnv._build_collision_primitives`).
 
 ## 4. Reference re-anchoring (affects how you feed `mimic_target_poses`)
 
-`fight.py` enables `realign_motion_with_humanoid_on_each_step=True`. Each step the
-reference root **XY** is shifted to coincide with the character's actual root, so an
-unavoidable shove does **not** accumulate absolute-position tracking error; pose
-shape, orientation, relative locomotion, and velocities are still tracked.
+`fight.py` enables `realign_motion_with_humanoid_on_each_step=True`, but the
+re-anchoring is **not** an instant per-step XY snap. It is a **smooth,
+velocity-error-proportional** update of a persisted reference XY offset
+(`reference_offset_xy`, called `respawn_root_offset[:, :2]` in ProtoMotions). Only
+the root **XY** offset is affected; pose shape, orientation, relative locomotion, and
+velocities are still tracked normally.
 
-Client implication: provide the future reference frames (`mimic.future_*`) using the
-**same convention the model was trained on** — i.e. expressed relative to the
-character's *current* root each frame, not a fixed world anchor. (The existing
-mimic obs already builds future targets relative to current state; re-anchoring just
-guarantees the offset is recomputed every step.)
+### 4.1 Why velocity-gated (not an instant snap)
+
+An instant snap re-anchors the reference to the character every frame regardless of
+*why* the character moved. That is fine for shoves but harmful for balance-critical
+clips (e.g. a **getup**): the reference origin chases the rising pelvis instead of
+pulling the body through the planned recovery trajectory. Gating the blend on the
+**unexpected** root XY velocity fixes this without any explicit "mode":
+
+- A character that moves *because the clip says so* (getup, deliberate locomotion)
+  has small velocity error → the offset stays put → the reference keeps guiding it.
+- A character shoved/slid by an external force has large velocity error → the offset
+  catches up → the reference stays reachable and the shove isn't over-penalized.
+
+### 4.2 Algorithm (mirror this exactly per agent, every step)
+
+Maintain `reference_offset_xy` as **persistent state** across frames (it is applied
+to every reference body position before building the `mimic.future_*` targets).
+Inputs are all in world frame at the current playback time:
+
+```
+target_xy = current_root_xy - ref_root_xy                       # instant-snap target
+vel_err   = norm(current_root_xy_vel - ref_root_xy_vel)          # "unexpected" speed
+
+t     = clamp((vel_err - vel_err_low) / (vel_err_high - vel_err_low), 0, 1)
+t     = t * t * (3 - 2 * t)                                      # smoothstep
+alpha = alpha_min + (alpha_max - alpha_min) * t
+
+new_xy = reference_offset_xy + alpha * (target_xy - reference_offset_xy)   # lerp
+
+# cap how fast the offset may drift per step
+delta      = new_xy - reference_offset_xy
+max_delta  = max_xy_speed * dt
+if norm(delta) > max_delta:
+    delta = delta * (max_delta / norm(delta))
+reference_offset_xy = reference_offset_xy + delta
+```
+
+- `current_root_xy` / `current_root_xy_vel`: the deployed character's root (pelvis)
+  world XY position and linear velocity.
+- `ref_root_xy` / `ref_root_xy_vel`: the reference clip's root XY position and
+  velocity at the current playback time (the same root body index used for the
+  mimic anchor).
+- `dt`: your control timestep (`simulator.dt` in ProtoMotions = `decimation / fps`).
+
+Reference implementation: `BaseEnv.update_smooth_motion_alignment` →
+`compute_smooth_realign_offset` in `protomotions/envs/base_env/utils.py`.
+
+### 4.3 Default parameters (Tier 1 base, frozen across tiers)
+
+Set on `MimicMotionManagerConfig` in `fight.py`; all higher tiers inherit them.
+
+| Param | Config field | Default | Meaning |
+|---|---|---|---|
+| `alpha_min` | `realign_alpha_min` | `0.0` | Blend at/below `vel_err_low` (0 = frozen offset). |
+| `alpha_max` | `realign_alpha_max` | `0.4` | Blend at/above `vel_err_high`. |
+| `vel_err_low` | `realign_vel_err_low` | `0.3` m/s | Below this, minimal re-anchor. |
+| `vel_err_high` | `realign_vel_err_high` | `1.5` m/s | At/above this, full blend strength. |
+| `max_xy_speed` | `realign_max_xy_speed` | `2.0` m/s | Cap on offset drift per step. |
+
+### 4.4 Reset / getup handling (one-shot align, no training mode)
+
+At **episode reset / clip start**, ProtoMotions sets the offset **instantly** (a full
+snap) via `update_respawn_root_offset_by_env_ids`; the smooth update only runs
+per-step thereafter. There is **no getup mode** in training — getup works because the
+clip-velocity-tracking character keeps `vel_err` low, so the offset stays frozen and
+the reference guides the recovery.
+
+Deployment clients should mirror this: when you **start a clip** or **enter your own
+getup mode**, set `reference_offset_xy` **instantly** to `current_root_xy -
+ref_root_xy` (one-shot align), then run the smooth update every subsequent step.
+
+### 4.5 Client implication for `mimic.future_*`
+
+Provide the future reference frames using the **same convention the model was trained
+on** — expressed relative to the character's *current* root each frame after applying
+`reference_offset_xy`, not a fixed world anchor. The mimic obs already builds future
+targets relative to current state; smooth re-anchoring only changes *how fast* the
+persisted XY offset tracks the character.
+
+> **Checkpoint compatibility.** This smooth re-anchoring changes the tracking
+> semantics relative to the earlier instant-snap behavior, so models trained with
+> instant snap are **not** compatible. Retrain the Tier 1 base with smooth
+> re-anchoring before warm-starting the higher tiers.
 
 ---
 
