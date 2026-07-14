@@ -51,6 +51,7 @@ from protomotions.envs.rewards.tracking import (
     compute_gv_rew,
     compute_gav_rew,
     compute_rh_rew,
+    compute_dof_pos_rew,
     # BeyondMimic-style kernels
     compute_global_position_error_exp,
     compute_global_anchor_pos_rew,
@@ -105,6 +106,7 @@ __all__ = [
     "compute_gv_rew",
     "compute_gav_rew",
     "compute_rh_rew",
+    "compute_dof_pos_rew",
     # BeyondMimic-style kernels
     "compute_global_position_error_exp",
     "compute_global_anchor_pos_rew",

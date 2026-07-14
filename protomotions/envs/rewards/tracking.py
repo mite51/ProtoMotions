@@ -59,6 +59,7 @@ def compute_gt_rew(
     current_rigid_body_pos: Tensor,
     ref_rigid_body_pos: Tensor,
     coefficient: float = -100.0,
+    mean_before_exp: bool = True,
 ) -> Tensor:
     """Position tracking reward (exponential MSE).
     
@@ -66,6 +67,12 @@ def compute_gt_rew(
         current_rigid_body_pos: Current body positions [num_envs, num_bodies, 3].
         ref_rigid_body_pos: Reference body positions [num_envs, num_bodies, 3].
         coefficient: Exponential coefficient for error.
+        mean_before_exp: If True (default), ``exp(coef * mean_body(err^2))`` -- a
+            single mis-tracked body is averaged (diluted) with the rest before the
+            exponential. If False, ``mean_body(exp(coef * err^2))`` -- each body
+            contributes independently, so a persistently off body (e.g. an
+            under-extended limb) cannot be masked by well-tracked ones. Use False
+            when you need a stronger per-body / extremity articulation signal.
     
     Returns:
         Reward tensor [num_envs].
@@ -74,6 +81,7 @@ def compute_gt_rew(
         current_rigid_body_pos,
         ref_rigid_body_pos,
         coefficient,
+        mean_before_exp=mean_before_exp,
     )
 
 
@@ -81,6 +89,7 @@ def compute_gr_rew(
     current_rigid_body_rot: Tensor,
     ref_rigid_body_rot: Tensor,
     coefficient: float = -5.0,
+    mean_before_exp: bool = True,
 ) -> Tensor:
     """Rotation tracking reward (exponential quaternion error).
     
@@ -88,6 +97,11 @@ def compute_gr_rew(
         current_rigid_body_rot: Current body rotations [num_envs, num_bodies, 4] (w-last).
         ref_rigid_body_rot: Reference body rotations [num_envs, num_bodies, 4] (w-last).
         coefficient: Exponential coefficient for error.
+        mean_before_exp: If True (default), ``exp(coef * mean_body(angle^2))``. If
+            False, ``mean_body(exp(coef * angle^2))`` so each body's orientation
+            error (which directly encodes limb bend/extension) contributes
+            independently and cannot be masked by well-tracked bodies. See
+            :func:`compute_gt_rew`.
     
     Returns:
         Reward tensor [num_envs].
@@ -96,6 +110,7 @@ def compute_gr_rew(
         current_rigid_body_rot,
         ref_rigid_body_rot,
         coefficient,
+        mean_before_exp=mean_before_exp,
     )
 
 
@@ -165,6 +180,41 @@ def compute_rh_rew(
         current_root_height,
         ref_root_height,
         coefficient,
+    )
+
+
+def compute_dof_pos_rew(
+    current_dof_pos: Tensor,
+    ref_dof_pos: Tensor,
+    coefficient: float = -5.0,
+    mean_before_exp: bool = False,
+) -> Tensor:
+    """Per-joint DOF-position (joint-angle) tracking reward (exponential).
+
+    Directly rewards matching each joint's reference angle, so every joint is
+    weighted equally instead of being diluted inside a Cartesian per-body mean.
+    This targets fine articulation the global body-position reward under-serves at
+    the extremities (e.g. knee flexion, full elbow/shoulder extension).
+
+    Each DOF is treated as its own "body" (last dim 1) so ``mean_before_exp=False``
+    yields ``mean_joint(exp(coef * angle_err^2))`` -- an independent per-joint
+    signal a well-tracked joint cannot mask.
+
+    Args:
+        current_dof_pos: Current joint positions [num_envs, num_dofs] (radians).
+        ref_dof_pos: Reference joint positions [num_envs, num_dofs] (radians).
+        coefficient: Exponential coefficient for the squared joint-angle error.
+        mean_before_exp: If True, ``exp(coef * mean_joint(err^2))`` (diluted). If
+            False (default), ``mean_joint(exp(coef * err^2))`` (per-joint).
+
+    Returns:
+        Reward tensor [num_envs] in range (0, 1] for negative coefficient.
+    """
+    return mean_squared_error_exp(
+        current_dof_pos.unsqueeze(-1),
+        ref_dof_pos.unsqueeze(-1),
+        coefficient,
+        mean_before_exp=mean_before_exp,
     )
 
 
@@ -420,6 +470,7 @@ __all__ = [
     "compute_gv_rew",
     "compute_gav_rew",
     "compute_rh_rew",
+    "compute_dof_pos_rew",
     # BeyondMimic-style rewards
     "compute_global_position_error_exp",
     "compute_global_anchor_pos_rew",

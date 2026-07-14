@@ -35,6 +35,14 @@ observation architecture used across every fighting-game training tier:
     a strength proportional to the "unexpected" root XY velocity (character vs. clip),
     so it stays stable when the character tracks the clip (e.g. getup) and only catches
     up under an external shove/slide. See the deployment doc for the exact algorithm.
+  - stronger whole-body articulation signal in the reward (TRAINING-ONLY; does not
+    touch the frozen obs/action layout or the ONNX): the global body-position reward
+    averages per-body error before the exponential, so a single under-articulated
+    limb (an unbent knee, a short punch) is diluted across the ~24 bodies. To fix
+    that without changing the network, the tracking bundle adds a per-body
+    (exp-before-mean) orientation term and an explicit per-joint DOF-angle reward
+    (``dof_pos_rew``), and relaxes ``action_smoothness`` so fast limb motion isn't
+    suppressed. Rewards are inherited by all higher tiers (which only ADD terms).
 
 In this Tier 1 base experiment the interference features are present but INERT:
 only the ground primitive is populated (no projectiles/opponents) and stamina
@@ -121,6 +129,7 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
         mimic_target_poses_max_coords_factory,
         action_smoothness_factory,
         mimic_tracking_rewards_factory,
+        dof_pos_rew_factory,
         pow_rew_factory,
         contact_match_rew_factory,
         tracking_error_term_factory,
@@ -153,19 +162,31 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
     }
 
     reward_components = {
-        "action_smoothness": action_smoothness_factory(weight=-0.02),
+        # Kept small so it doesn't suppress the fast limb articulation (punches,
+        # knee flexion) the tracking terms below are meant to elicit.
+        "action_smoothness": action_smoothness_factory(weight=-0.005),
         **mimic_tracking_rewards_factory(
             gt_weight=0.5,
-            gr_weight=0.3,
+            # Body-orientation tracking is the term that most directly encodes limb
+            # bend/extension. Strengthened (weight 0.3->0.5, coef -5->-10) and, more
+            # importantly, aggregated per-body (mean_before_exp=False) so a single
+            # under-articulated limb (an unbent knee, a short punch) is no longer
+            # diluted across the ~24 bodies before the exponential.
+            gr_weight=0.5,
             gv_weight=0.1,
             gav_weight=0.2,
             rh_weight=0.2,
             gt_coef=-25.0,
-            gr_coef=-5.0,
+            gr_coef=-10.0,
             gv_coef=-0.5,
             gav_coef=-0.1,
             rh_coef=-100.0,
+            gr_mean_before_exp=False,
         ),
+        # Direct per-joint angle tracking: weights every joint equally instead of
+        # diluting extremities inside the Cartesian body-position mean. This is the
+        # primary lever that makes knees flex and arms fully extend to match.
+        "dof_pos_rew": dof_pos_rew_factory(weight=0.5, coefficient=-5.0),
         "pow_rew": pow_rew_factory(weight=-1e-5, min_value=-0.5),
         "contact_match_rew": contact_match_rew_factory(
             weight=-0.1, zero_during_grace_period=True

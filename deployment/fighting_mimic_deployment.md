@@ -28,6 +28,7 @@ and timing below, the same `.onnx` will drive it identically to ProtoMotions.
 | Contacts | usually off | **`observe_contacts=True`** on a frozen body set |
 | Per-limb strength | n/a | **`stamina_obs`** = per-body joint-stiffness scale; the engine's per-joint gains are set to `nominal * stamina` |
 | Reference tracking | world-anchored | **smooth velocity-error XY re-anchoring** (shoves don't accumulate absolute-position error; a stable-tracking clip like getup leaves the anchor put) |
+| Tracking reward | global body pos/rot/vel, mean-over-bodies | **+ per-body (exp-before-mean) orientation reward and an explicit per-joint DOF-angle reward** so extremities (knees, arms) actually articulate instead of being diluted in the body mean. **Training-only** — no effect on obs/action/ONNX. See §8.3 |
 | Action outputs | joint position targets | joint position targets (same contract; gains live in the engine, not the action output) |
 
 Experiment files: `examples/experiments/mimic/fight.py` (Tier 1 base, defines the
@@ -462,6 +463,38 @@ multi-hour runs from crashing on these rare events, the fighting tiers add three
    so a cube travels ≲ its own size per substep (avoids tunneling). Ramp back up via
    `--overrides simulator.projectile.{speed_range,auto_throw_prob,density}=...` as the
    policy hardens.
+
+## 8.3 Whole-body tracking reward (training-only, deploy-irrelevant)
+
+The stock mimic reward tracks **global body position/rotation/velocity** and, in every
+kernel, averages the per-body error **before** the exponential
+(`exp(coef · mean_over_bodies(err²))`, `mean_before_exp=True` in
+`protomotions/envs/rewards/base.py`). That dilutes any single mis-tracked body across
+the ~24 bodies, so extremities — which move and matter most (a fully-extended punch, a
+deep knee bend) — get almost no gradient. The symptom is a policy that follows the
+gross motion but keeps knees straight and punches short, while a loose eval threshold
+(mean per-body error < 0.5 m) still reports high success.
+
+The fighting tiers fix this **in the reward only** (defined once in `fight.py`;
+`fight_throw`/`fight_stamina`/`fight_multichar` inherit it and only ADD terms):
+
+1. **Per-body orientation reward** (`gr_rew`): weight `0.3 → 0.5`, coef `-5 → -10`, and
+   aggregated `mean_before_exp=False` (`mean_over_bodies(exp(coef · angle²))`) so a
+   badly-oriented limb can't be masked by well-tracked bodies. Body orientation is what
+   directly encodes limb bend/extension.
+2. **Per-joint DOF-angle reward** (`dof_pos_rew`, `dof_pos_rew_factory`): a new term
+   binding the sim `current.dof_pos` to `mimic.ref_state.dof_pos`. It weights every
+   joint equally instead of diluting extremities inside the Cartesian body mean, and is
+   the primary lever that makes knees flex and arms fully extend to match.
+3. **Relaxed `action_smoothness`** (`-0.02 → -0.005`) so the smoothness penalty doesn't
+   suppress the fast limb motion the tracking terms are meant to elicit.
+
+These are training signals only: they do **not** change the observation layout, the
+action contract, the control mode, or the exported ONNX graph, so every deployment note
+above is unaffected and higher tiers still warm-start from this checkpoint. Toggle the
+aggregation per term via `gt_mean_before_exp` / `gr_mean_before_exp` on
+`mimic_tracking_rewards_factory`; a stricter eval (`tracking_error` / `gt_error`
+threshold `0.5 → ~0.25-0.3`) makes extremity quality visible in the score.
 
 ## 9. Quick checklist for a new inference client
 

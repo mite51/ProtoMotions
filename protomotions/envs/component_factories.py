@@ -543,12 +543,21 @@ def action_smoothness_factory(weight: float = -0.02) -> MdpComponent:
     )
 
 
-def gt_rew_factory(weight: float = 0.5, coefficient: float = -100.0) -> MdpComponent:
+def gt_rew_factory(
+    weight: float = 0.5,
+    coefficient: float = -100.0,
+    mean_before_exp: bool = True,
+) -> MdpComponent:
     """Factory for position tracking reward.
 
     Args:
         weight: Reward weight.
         coefficient: Exponential coefficient for error.
+        mean_before_exp: If True (default), average per-body error before the
+            exponential (a single mis-tracked body is diluted). If False, average
+            after the exponential so each body contributes independently -- a
+            stronger per-body / extremity articulation signal. See
+            ``compute_gt_rew``.
 
     Returns:
         MdpComponent configured for position tracking.
@@ -561,16 +570,28 @@ def gt_rew_factory(weight: float = 0.5, coefficient: float = -100.0) -> MdpCompo
             "current_rigid_body_pos": EnvContext.current.rigid_body_pos,
             "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
         },
-        static_params={"weight": weight, "coefficient": coefficient},
+        static_params={
+            "weight": weight,
+            "coefficient": coefficient,
+            "mean_before_exp": mean_before_exp,
+        },
     )
 
 
-def gr_rew_factory(weight: float = 0.3, coefficient: float = -5.0) -> MdpComponent:
+def gr_rew_factory(
+    weight: float = 0.3,
+    coefficient: float = -5.0,
+    mean_before_exp: bool = True,
+) -> MdpComponent:
     """Factory for rotation tracking reward.
 
     Args:
         weight: Reward weight.
         coefficient: Exponential coefficient for error.
+        mean_before_exp: If True (default), average per-body angle error before the
+            exponential. If False, average after -- so each body's orientation
+            error (which directly encodes limb bend/extension) contributes
+            independently. See ``compute_gr_rew``.
 
     Returns:
         MdpComponent configured for rotation tracking.
@@ -583,7 +604,48 @@ def gr_rew_factory(weight: float = 0.3, coefficient: float = -5.0) -> MdpCompone
             "current_rigid_body_rot": EnvContext.current.rigid_body_rot,
             "ref_rigid_body_rot": EnvContext.mimic.ref_state.rigid_body_rot,
         },
-        static_params={"weight": weight, "coefficient": coefficient},
+        static_params={
+            "weight": weight,
+            "coefficient": coefficient,
+            "mean_before_exp": mean_before_exp,
+        },
+    )
+
+
+def dof_pos_rew_factory(
+    weight: float = 0.5,
+    coefficient: float = -5.0,
+    mean_before_exp: bool = False,
+) -> MdpComponent:
+    """Factory for the per-joint DOF-position (joint-angle) tracking reward.
+
+    Directly rewards matching each joint's reference angle, weighting every joint
+    equally instead of diluting it inside a Cartesian per-body mean. Targets the
+    fine articulation (knee flexion, full elbow/shoulder extension) that the global
+    body-position reward under-serves at the extremities.
+
+    Args:
+        weight: Reward weight.
+        coefficient: Exponential coefficient for the squared joint-angle error.
+        mean_before_exp: If False (default), ``mean_joint(exp(coef * err^2))`` --
+            an independent per-joint signal. If True, ``exp(coef * mean_joint(err^2))``.
+
+    Returns:
+        MdpComponent configured for per-joint DOF-position tracking.
+    """
+    from protomotions.envs.rewards import compute_dof_pos_rew
+
+    return MdpComponent(
+        compute_func=compute_dof_pos_rew,
+        dynamic_vars={
+            "current_dof_pos": EnvContext.current.dof_pos,
+            "ref_dof_pos": EnvContext.mimic.ref_state.dof_pos,
+        },
+        static_params={
+            "weight": weight,
+            "coefficient": coefficient,
+            "mean_before_exp": mean_before_exp,
+        },
     )
 
 
@@ -664,6 +726,8 @@ def mimic_tracking_rewards_factory(
     gv_coef: float = -0.5,
     gav_coef: float = -0.1,
     rh_coef: float = -100.0,
+    gt_mean_before_exp: bool = True,
+    gr_mean_before_exp: bool = True,
 ) -> Dict[str, MdpComponent]:
     """Factory for standard mimic tracking reward bundle.
 
@@ -680,13 +744,25 @@ def mimic_tracking_rewards_factory(
         gv_coef: Velocity coefficient.
         gav_coef: Angular velocity coefficient.
         rh_coef: Root height coefficient.
+        gt_mean_before_exp: Aggregation for the position term (see
+            ``gt_rew_factory``). Set False for a stronger per-body signal.
+        gr_mean_before_exp: Aggregation for the rotation term (see
+            ``gr_rew_factory``). Set False for a stronger per-body signal.
 
     Returns:
         Dict of MdpComponent instances for tracking rewards.
     """
     return {
-        "gt_rew": gt_rew_factory(weight=gt_weight, coefficient=gt_coef),
-        "gr_rew": gr_rew_factory(weight=gr_weight, coefficient=gr_coef),
+        "gt_rew": gt_rew_factory(
+            weight=gt_weight,
+            coefficient=gt_coef,
+            mean_before_exp=gt_mean_before_exp,
+        ),
+        "gr_rew": gr_rew_factory(
+            weight=gr_weight,
+            coefficient=gr_coef,
+            mean_before_exp=gr_mean_before_exp,
+        ),
         "gv_rew": gv_rew_factory(weight=gv_weight, coefficient=gv_coef),
         "gav_rew": gav_rew_factory(weight=gav_weight, coefficient=gav_coef),
         "rh_rew": rh_rew_factory(weight=rh_weight, coefficient=rh_coef),
@@ -1448,6 +1524,7 @@ __all__ = [
     "gv_rew",
     "gav_rew",
     "rh_rew",
+    "dof_pos_rew_factory",
     "mimic_tracking_rewards_factory",
     "pow_rew",
     "contact_match_rew",
