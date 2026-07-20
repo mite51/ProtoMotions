@@ -947,6 +947,42 @@ def opponent_impact_rew_factory(
     )
 
 
+def realign_penalty_rew_factory(
+    weight: float = -0.05,
+    deadzone: float = 0.0,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the re-anchor reliance penalty.
+
+    Penalizes how far smooth re-anchoring shifted the mimic reference this step
+    (``realign_offset_delta``), so the policy treats re-anchoring as a safety net
+    rather than a crutch. When re-anchoring is disabled (e.g. the Tier 1 base) the
+    delta is 0, so this reward is a no-op; it becomes active in tiers that enable
+    re-anchoring. Safe in any config.
+
+    Args:
+        weight: Reward weight (negative to penalize re-anchoring).
+        deadzone: Per-step shift magnitude (m) below which no penalty is applied.
+        zero_during_grace_period: If True, zero reward during the reset grace period.
+
+    Returns:
+        MdpComponent configured for the re-anchor reliance penalty.
+    """
+    from protomotions.envs.rewards import compute_realign_penalty
+
+    return MdpComponent(
+        compute_func=compute_realign_penalty,
+        dynamic_vars={
+            "realign_offset_delta": EnvContext.realign_offset_delta,
+        },
+        static_params={
+            "deadzone": deadzone,
+            "weight": weight,
+            "zero_during_grace_period": zero_during_grace_period,
+        },
+    )
+
+
 # =============================================================================
 # Termination Factories
 # =============================================================================
@@ -1531,6 +1567,7 @@ __all__ = [
     "contact_force_change_rew",
     "body_impact_penalty_rew_factory",
     "opponent_impact_rew_factory",
+    "realign_penalty_rew_factory",
     # BeyondMimic reward factories
     "global_anchor_pos_rew",
     "global_anchor_ori_rew",

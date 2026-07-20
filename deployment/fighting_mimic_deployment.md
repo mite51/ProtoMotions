@@ -27,7 +27,7 @@ and timing below, the same `.onnx` will drive it identically to ProtoMotions.
 | Ground sensing | root-height / terrain obs | **`collision_primitives`** — unified egocentric encoding of ground + obstacles + projectiles + (later) opponents |
 | Contacts | usually off | **`observe_contacts=True`** on a frozen body set |
 | Per-limb strength | n/a | **`stamina_obs`** = per-body joint-stiffness scale; the engine's per-joint gains are set to `nominal * stamina` |
-| Reference tracking | world-anchored | **smooth velocity-error XY re-anchoring** (shoves don't accumulate absolute-position error; a stable-tracking clip like getup leaves the anchor put) |
+| Reference tracking | world-anchored | **smooth velocity-error XY re-anchoring**, OFF in the Tier 1 base (pure tracking), ON in the interference tiers (shoves don't accumulate absolute-position error; a stable-tracking clip like getup leaves the anchor put). A training-only penalty discourages relying on it. See §4 |
 | Tracking reward | global body pos/rot/vel, mean-over-bodies | **+ per-body (exp-before-mean) orientation reward and an explicit per-joint DOF-angle reward** so extremities (knees, arms) actually articulate instead of being diluted in the body mean. **Training-only** — no effect on obs/action/ONNX. See §8.3 |
 | Action outputs | joint position targets | joint position targets (same contract; gains live in the engine, not the action output) |
 
@@ -151,12 +151,19 @@ velocity by finite difference — see `BaseEnv._build_collision_primitives`).
 
 ## 4. Reference re-anchoring (affects how you feed `mimic_target_poses`)
 
-`fight.py` enables `realign_motion_with_humanoid_on_each_step=True`, but the
-re-anchoring is **not** an instant per-step XY snap. It is a **smooth,
-velocity-error-proportional** update of a persisted reference XY offset
-(`reference_offset_xy`, called `respawn_root_offset[:, :2]` in ProtoMotions). Only
-the root **XY** offset is affected; pose shape, orientation, relative locomotion, and
-velocities are still tracked normally.
+Re-anchoring is a **smooth, velocity-error-proportional** update of a persisted
+reference XY offset (`reference_offset_xy`, called `respawn_root_offset[:, :2]` in
+ProtoMotions) — **not** an instant per-step XY snap. Only the root **XY** offset is
+affected; pose shape, orientation, relative locomotion, and velocities are still
+tracked normally.
+
+**Where it is active.** It is **disabled in the Tier 1 base** (`fight.py`,
+`realign_motion_with_humanoid_on_each_step=False`) so the base learns pure tracking
+with no crutch, and **enabled in the interference tiers** (`fight_throw.py` sets the
+flag `True`; `fight_stamina.py` / `fight_multichar.py` inherit it). Deployed
+checkpoints are trained from an interference tier, so re-anchoring is normally active
+at deployment — mirror the algorithm below. (A single-clip client running a base-only
+checkpoint would simply keep `reference_offset_xy` fixed.)
 
 ### 4.1 Why velocity-gated (not an instant snap)
 
@@ -205,9 +212,11 @@ reference_offset_xy = reference_offset_xy + delta
 Reference implementation: `BaseEnv.update_smooth_motion_alignment` →
 `compute_smooth_realign_offset` in `protomotions/envs/base_env/utils.py`.
 
-### 4.3 Default parameters (Tier 1 base, frozen across tiers)
+### 4.3 Default parameters
 
-Set on `MimicMotionManagerConfig` in `fight.py`; all higher tiers inherit them.
+Set on `MimicMotionManagerConfig` in `fight.py` (kept there even though the base has
+re-anchoring off, so the interference tiers inherit tuned values by flipping only the
+enable flag).
 
 | Param | Config field | Default | Meaning |
 |---|---|---|---|
@@ -216,6 +225,14 @@ Set on `MimicMotionManagerConfig` in `fight.py`; all higher tiers inherit them.
 | `vel_err_low` | `realign_vel_err_low` | `0.3` m/s | Below this, minimal re-anchor. |
 | `vel_err_high` | `realign_vel_err_high` | `1.5` m/s | At/above this, full blend strength. |
 | `max_xy_speed` | `realign_max_xy_speed` | `2.0` m/s | Cap on offset drift per step. |
+
+**Re-anchor reliance penalty (TRAINING-ONLY).** In the interference tiers a small
+negative reward (`realign_penalty`, weight `-0.05`) is applied proportional to how far
+the reference offset was shifted each step (`realign_offset_delta`, the magnitude of
+`reference_offset_xy`'s per-step change). This nudges the policy to hold its own
+position and treat re-anchoring as a safety net rather than a crutch. It is a no-op in
+the Tier 1 base (re-anchoring off → delta is 0) and has **no effect on the
+obs/action layout or the exported ONNX** — clients do not implement it.
 
 ### 4.4 Reset / getup handling (one-shot align, no training mode)
 
@@ -237,10 +254,11 @@ on** — expressed relative to the character's *current* root each frame after a
 targets relative to current state; smooth re-anchoring only changes *how fast* the
 persisted XY offset tracks the character.
 
-> **Checkpoint compatibility.** This smooth re-anchoring changes the tracking
-> semantics relative to the earlier instant-snap behavior, so models trained with
-> instant snap are **not** compatible. Retrain the Tier 1 base with smooth
-> re-anchoring before warm-starting the higher tiers.
+> **Checkpoint compatibility.** Re-anchoring is off in the Tier 1 base and on
+> (smooth, velocity-error) from `fight_throw.py` onward, which differs from any earlier
+> instant-snap or always-on behavior. Models trained under the old semantics are **not**
+> compatible — retrain the base (pure tracking) and re-run the interference tiers so the
+> policy learns tracking first and re-anchoring as a safety net second.
 
 ---
 

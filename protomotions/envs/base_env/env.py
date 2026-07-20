@@ -225,6 +225,14 @@ class BaseEnv:
             self.num_envs, 3, dtype=torch.float, device=self.device
         )
 
+        # Magnitude (m) the reference XY offset was shifted this step by smooth
+        # re-anchoring. Penalized (realign_penalty reward) so the policy treats
+        # re-anchoring as a safety net rather than a crutch. Stays 0 when re-anchoring
+        # is disabled (e.g. the Tier 1 base), making the penalty a no-op there.
+        self._realign_offset_delta = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device
+        )
+
         # Contact force tracking for impact penalty rewards
         # Initialized properly after simulator init when we know num_bodies
         self.prev_contact_force_magnitudes = None
@@ -787,18 +795,24 @@ class BaseEnv:
             self.motion_manager.motion_times[env_ids],
         )
 
-        self.respawn_root_offset[env_ids, :2] = compute_smooth_realign_offset(
+        prev_offset_xy = self.respawn_root_offset[env_ids, :2].clone()
+        new_offset_xy = compute_smooth_realign_offset(
             current_root_xy=root_state.root_pos[:, :2],
             ref_root_xy=ref_state.rigid_body_pos[:, 0, :2],
             current_root_xy_vel=root_state.root_vel[:, :2],
             ref_root_xy_vel=ref_state.rigid_body_vel[:, 0, :2],
-            prev_offset_xy=self.respawn_root_offset[env_ids, :2],
+            prev_offset_xy=prev_offset_xy,
             alpha_min=cfg.realign_alpha_min,
             alpha_max=cfg.realign_alpha_max,
             vel_err_low=cfg.realign_vel_err_low,
             vel_err_high=cfg.realign_vel_err_high,
             max_xy_speed=cfg.realign_max_xy_speed,
             dt=dt,
+        )
+        self.respawn_root_offset[env_ids, :2] = new_offset_xy
+        # Record how far the reference was shifted this step (fed to realign_penalty).
+        self._realign_offset_delta[env_ids] = torch.linalg.norm(
+            new_offset_xy - prev_offset_xy, dim=-1
         )
 
     def get_spawn_to_ref_pose_offset_with_terrain_height_correction(
@@ -1229,6 +1243,7 @@ class BaseEnv:
             incoming_damage=getattr(self, "_incoming_damage", None),
             body_stamina=getattr(self, "_body_stamina", None),
             opponent_impact=getattr(self, "_opponent_impact", None),
+            realign_offset_delta=getattr(self, "_realign_offset_delta", None),
             dt=self.dt,
             # Contact tracking
             contact_body_ids=self.contact_body_ids,
@@ -1905,6 +1920,7 @@ class BaseEnv:
         self.reset_buf[env_ids] = False
         self.terminate_buf[env_ids] = False
         self.prev_contact_force_magnitudes[env_ids] = 0.0
+        self._realign_offset_delta[env_ids] = 0.0
         self._current_raw_action[env_ids] = 0.0
         self._current_processed_action[env_ids] = 0.0
 

@@ -590,6 +590,7 @@ class EnvContext:
     incoming_damage: Optional[Tensor] = FieldPath()
     body_stamina: Optional[Tensor] = FieldPath()
     opponent_impact: Optional[Tensor] = FieldPath()
+    realign_offset_delta: Optional[Tensor] = FieldPath()
     dt: float = FieldPath()
 
     # Contact tracking
@@ -624,6 +625,7 @@ class EnvContext:
         incoming_damage: Optional[Tensor] = None,
         body_stamina: Optional[Tensor] = None,
         opponent_impact: Optional[Tensor] = None,
+        realign_offset_delta: Optional[Tensor] = None,
         contact_body_ids: Optional[Tensor] = None,
         collision_primitives: Optional[CollisionPrimitivesView] = None,
         mimic: Optional[MimicContext] = None,
@@ -676,6 +678,7 @@ class EnvContext:
         self.incoming_damage = incoming_damage
         self.body_stamina = body_stamina
         self.opponent_impact = opponent_impact
+        self.realign_offset_delta = realign_offset_delta
 
         # Contact tracking
         self.contact_body_ids = contact_body_ids

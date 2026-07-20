@@ -31,6 +31,12 @@ What Tier 2 adds on top of the frozen base:
   - ``body_impact_penalty``: penalizes high-force impacts on vulnerable bodies
     (everything EXCEPT hands and feet), scaled by the incoming threat's damage.
     Hands/feet are exempt so striking/contact and footstep loads aren't punished.
+  - Smooth velocity-error XY re-anchoring turns ON here (the Tier 1 base keeps it OFF
+    to learn pure tracking first). Real interference begins in this tier, so the
+    reference offset may now shift to follow an unavoidable shove/slide; the
+    ``realign_penalty`` reward (inherited from the base, dormant there) becomes active
+    and discourages the policy from leaning on it. Smooth params are inherited from
+    ``fight.py``.
 
 Curriculum: ramp ``auto_throw_prob`` from ~0 upward via overrides as the policy
 stabilizes, e.g. ``--overrides simulator.projectile.auto_throw_prob=0.03``.
@@ -114,6 +120,13 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
     from protomotions.envs.component_factories import body_impact_penalty_rew_factory
 
     cfg = _base.env_config(robot_cfg, args)
+
+    # Re-anchoring is DISABLED in the Tier 1 base (pure tracking, no crutch). Turn it
+    # on here, the first interference tier (thrown colliders); fight_stamina.py and
+    # fight_multichar.py inherit it through the tier chain. This also activates the
+    # realign reliance penalty (already in reward_components, inherited from fight.py)
+    # because the reference offset now actually moves.
+    cfg.motion_manager.realign_motion_with_humanoid_on_each_step = True
 
     cfg.reward_components["body_impact_penalty"] = body_impact_penalty_rew_factory(
         vulnerable_body_indices=_vulnerable_body_indices(robot_cfg),

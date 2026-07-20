@@ -25,6 +25,7 @@ import torch
 
 from protomotions.envs.base_env.env import BaseEnv
 from protomotions.envs.base_env.utils import compute_smooth_realign_offset
+from protomotions.envs.rewards.regularization import compute_realign_penalty
 
 
 _PARAMS = dict(
@@ -114,6 +115,7 @@ def _bare_env() -> BaseEnv:
     env.device = torch.device("cpu")
     env.num_envs = 1
     env.respawn_root_offset = torch.zeros(1, 3)
+    env._realign_offset_delta = torch.zeros(1)
     return env
 
 
@@ -179,5 +181,55 @@ def test_update_smooth_motion_alignment_wires_states():
 
     env.update_smooth_motion_alignment(torch.tensor([0]), dt=_PARAMS["dt"])
 
-    # vel_err == 0 -> alpha_min (0) -> offset unchanged.
+    # vel_err == 0 -> alpha_min (0) -> offset unchanged and zero re-anchor delta.
     assert torch.allclose(env.respawn_root_offset[:, :2], torch.tensor([[0.5, 0.5]]))
+    assert torch.allclose(env._realign_offset_delta, torch.zeros(1))
+
+
+def test_update_smooth_motion_alignment_records_shift_delta():
+    # Under a large velocity mismatch the offset moves and the recorded delta equals
+    # the magnitude of that per-step shift.
+    env = _bare_env()
+    cfg = SimpleNamespace(
+        realign_alpha_min=_PARAMS["alpha_min"],
+        realign_alpha_max=_PARAMS["alpha_max"],
+        realign_vel_err_low=_PARAMS["vel_err_low"],
+        realign_vel_err_high=_PARAMS["vel_err_high"],
+        realign_max_xy_speed=_PARAMS["max_xy_speed"],
+    )
+    env.motion_manager = SimpleNamespace(
+        config=cfg,
+        motion_ids=torch.tensor([0]),
+        motion_times=torch.tensor([0.0]),
+    )
+    env.motion_lib = _MotionLib(
+        root_pos=torch.tensor([[0.0, 0.0, 1.0]]),
+        root_vel=torch.tensor([[0.0, 0.0, 0.0]]),
+    )
+    env.simulator = SimpleNamespace(
+        get_root_state=lambda env_ids: SimpleNamespace(
+            root_pos=torch.tensor([[0.05, 0.0, 1.0]]),
+            root_vel=torch.tensor([[5.0, 0.0, 0.0]]),
+        )
+    )
+
+    env.update_smooth_motion_alignment(torch.tensor([0]), dt=_PARAMS["dt"])
+
+    # vel_err = 5 >> vel_err_high -> alpha_max = 0.4; target = [0.05, 0].
+    expected_delta = torch.tensor([0.4 * 0.05])
+    assert torch.allclose(env._realign_offset_delta, expected_delta, atol=1e-6)
+    assert torch.allclose(
+        env.respawn_root_offset[:, :2], torch.tensor([[0.4 * 0.05, 0.0]]), atol=1e-6
+    )
+
+
+def test_realign_penalty_kernel_returns_shift_magnitude():
+    delta = torch.tensor([0.0, 0.1, 0.5])
+    assert torch.allclose(compute_realign_penalty(delta), delta)
+
+
+def test_realign_penalty_kernel_deadzone():
+    delta = torch.tensor([0.05, 0.2, 0.5])
+    out = compute_realign_penalty(delta, deadzone=0.1)
+    # max(delta - 0.1, 0)
+    assert torch.allclose(out, torch.tensor([0.0, 0.1, 0.4]), atol=1e-6)

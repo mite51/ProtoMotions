@@ -307,6 +307,27 @@ def compute_opponent_impact_reward(opponent_impact: Tensor) -> Tensor:
     return opponent_impact
 
 
+def compute_realign_penalty(
+    realign_offset_delta: Tensor, deadzone: float = 0.0
+) -> Tensor:
+    """Penalty proportional to how far the mimic reference was re-anchored this step.
+
+    ``realign_offset_delta`` is the per-step reference XY offset shift magnitude (m)
+    produced by smooth re-anchoring. Returns ``max(delta - deadzone, 0)`` (positive);
+    apply a negative weight in the factory so the policy is nudged to hold its own
+    position rather than lean on re-anchoring as a crutch. With re-anchoring disabled
+    (e.g. the Tier 1 base) the delta is 0, so this is identically 0.
+
+    Args:
+        realign_offset_delta: Per-step re-anchor shift magnitude [num_envs].
+        deadzone: Shift magnitude (m) below which no penalty is applied.
+
+    Returns:
+        Per-env penalty magnitude [num_envs] (non-negative).
+    """
+    return torch.clamp(realign_offset_delta - deadzone, min=0.0)
+
+
 __all__ = [
     # Main reward kernels
     "compute_action_smoothness",
@@ -317,6 +338,7 @@ __all__ = [
     "compute_contact_force_change_rew",
     "compute_body_impact_penalty",
     "compute_opponent_impact_reward",
+    "compute_realign_penalty",
     # Helper functions
     "joint_limit_violation",
     "contact_mismatch_sum",

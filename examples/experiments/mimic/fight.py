@@ -29,12 +29,14 @@ observation architecture used across every fighting-game training tier:
     ``Simulator.set_joint_gain_scale``). Inert (==1.0, i.e. nominal gains) until
     the stamina tier turns on randomization.
   - smooth velocity-error XY motion re-anchoring
-    (``realign_motion_with_humanoid_on_each_step``) so an unavoidable shove doesn't
-    accumulate absolute-position tracking error; pose shape, orientation, and relative
-    locomotion are still tracked. The reference offset blends toward the character with
-    a strength proportional to the "unexpected" root XY velocity (character vs. clip),
-    so it stays stable when the character tracks the clip (e.g. getup) and only catches
-    up under an external shove/slide. See the deployment doc for the exact algorithm.
+    (``realign_motion_with_humanoid_on_each_step``), which blends the reference offset
+    toward the character with a strength proportional to the "unexpected" root XY
+    velocity (character vs. clip) so an unavoidable shove doesn't accumulate
+    absolute-position tracking error while pose/orientation/velocities are still
+    tracked. This Tier 1 base trains PURE tracking with re-anchoring DISABLED (no
+    crutch); the interference tiers (``fight_throw.py`` and below) turn it on. The
+    smooth params are kept here (dormant) so those tiers inherit tuned values by only
+    flipping the flag. See the deployment doc for the exact algorithm.
   - stronger whole-body articulation signal in the reward (TRAINING-ONLY; does not
     touch the frozen obs/action layout or the ONNX): the global body-position reward
     averages per-body error before the exponential, so a single under-articulated
@@ -132,6 +134,7 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
         dof_pos_rew_factory,
         pow_rew_factory,
         contact_match_rew_factory,
+        realign_penalty_rew_factory,
         tracking_error_term_factory,
     )
     from protomotions.envs.action import make_pd_action_config
@@ -191,6 +194,13 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
         "contact_match_rew": contact_match_rew_factory(
             weight=-0.1, zero_during_grace_period=True
         ),
+        # Discourage leaning on re-anchoring as a crutch: penalize how far the
+        # reference was shifted each step. A no-op in this Tier 1 base (re-anchoring
+        # disabled -> delta is 0); active in the interference tiers that turn
+        # re-anchoring on, all of which inherit this reward via _base.env_config().
+        "realign_penalty": realign_penalty_rew_factory(
+            weight=-0.05, zero_during_grace_period=True
+        ),
     }
 
     return EnvConfig(
@@ -210,16 +220,18 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
         motion_manager=MimicMotionManagerConfig(
             init_start_prob=0.2,
             resample_on_reset=True,
-            # Smooth velocity-error XY re-anchoring: each step the reference XY offset
-            # is blended toward the character's actual root (via respawn_root_offset)
-            # with a strength proportional to the "unexpected" root XY velocity
-            # (character vs. clip). Absolute XY drift from an unavoidable shove/impact
-            # is NOT penalized, while pose shape, orientation, relative locomotion, and
-            # velocities are still tracked. Because the blend is gated on velocity
-            # mismatch, balance-critical clips (e.g. getup) that track the clip velocity
-            # leave the offset stable instead of chasing a moving target. Enabled from
-            # the Tier 1 base so tracking semantics stay identical across every tier.
-            realign_motion_with_humanoid_on_each_step=True,
+            # Tier 1 base trains PURE tracking with re-anchoring DISABLED so the policy
+            # learns to hold its own position/balance with no crutch. The interference
+            # tiers (fight_throw.py -> fight_stamina.py -> fight_multichar.py) flip this
+            # flag to True where real interference begins. The smooth velocity-error
+            # params below are kept (dormant) so those tiers inherit tuned values by
+            # changing only the boolean. When enabled, the reference XY offset blends
+            # toward the character's root with a strength proportional to the
+            # "unexpected" root XY velocity (character vs. clip), so absolute XY drift
+            # from an unavoidable shove is not penalized while pose/orientation/
+            # velocities are still tracked, and balance-critical clips (e.g. getup) that
+            # track the clip velocity leave the offset stable.
+            realign_motion_with_humanoid_on_each_step=False,
             realign_alpha_min=0.0,
             realign_alpha_max=0.4,
             realign_vel_err_low=0.3,
