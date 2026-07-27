@@ -362,24 +362,16 @@ def main():
             scene_lib_config,
         )
 
-    # Create fabric config for inference (simplified, single-device)
-    import sys  # noqa: E402
+    # Create fabric config for inference (simplified)
     # MuJoCo is CPU-only, so force CPU accelerator
-    accelerator = "cpu"# if args.simulator == "mujoco" else "gpu"
-    fabric_kwargs = dict(
+    accelerator = "cpu"  # if args.simulator == "mujoco" else "gpu"
+    fabric_config = FabricConfig(
         accelerator=accelerator,
         devices=1,
         num_nodes=1,
         loggers=[],  # No loggers needed for inference
         callbacks=[],  # No callbacks needed for inference
     )
-    # On Windows, NCCL is unavailable, so fall back to a single-device strategy.
-    # On other platforms, let FabricConfig use its default (DDPStrategy).
-    if sys.platform == "win32":
-        from lightning.fabric.strategies import SingleDeviceStrategy
-        device = "cpu"# torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        fabric_kwargs["strategy"] = SingleDeviceStrategy(device=device)
-    fabric_config = FabricConfig(**fabric_kwargs)
     fabric: Fabric = Fabric(**asdict(fabric_config))
     fabric.launch()
 

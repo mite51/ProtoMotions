@@ -312,18 +312,7 @@ class BaseAgent:
         # Save environment checkpoint for unique task IDs
         task_id = self.env.get_task_id()
         per_rank_task_id = [None for _ in range(self.fabric.world_size)]
-        # Only call the distributed gather when an actual process group is
-        # initialized. SingleDeviceStrategy (e.g. on Windows where NCCL is
-        # unavailable) runs without a process group, so skip the collective
-        # and just record the local task_id.
-        if (
-            self.fabric.world_size > 1
-            and dist.is_available()
-            and dist.is_initialized()
-        ):
-            dist.all_gather_object(per_rank_task_id, task_id)
-        else:
-            per_rank_task_id[0] = task_id
+        dist.all_gather_object(per_rank_task_id, task_id)
 
         # Only ranks with unique task IDs save the env checkpoint
         rank_to_task_id = {}
@@ -342,16 +331,11 @@ class BaseAgent:
             )
         self.fabric.barrier()
 
-        # Check if new high score flag is consistent across devices.
-        # Skip the gather under single-device (e.g. SingleDeviceStrategy on
-        # Windows): there's only one rank, so it's trivially consistent, and
-        # fabric.all_gather on a Python scalar returns a 0-d tensor that
-        # can't be iterated.
-        if self.fabric.world_size > 1:
-            gathered_high_score = self.fabric.all_gather(new_high_score)
-            assert all(
-                [x == gathered_high_score[0] for x in gathered_high_score]
-            ), "New high score flag should be the same across all ranks."
+        # Check if new high score flag is consistent across devices
+        gathered_high_score = self.fabric.all_gather(new_high_score)
+        assert all(
+            [x == gathered_high_score[0] for x in gathered_high_score]
+        ), "New high score flag should be the same across all ranks."
 
         if new_high_score:
             self.fabric.save(save_dir / "score_based.ckpt", state_dict)

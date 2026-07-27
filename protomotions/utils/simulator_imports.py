@@ -51,13 +51,6 @@ def import_simulator_before_torch(simulator_name):
 
         return None
     elif simulator_name == "isaaclab":
-        # Import mujoco before isaaclab to prevent DLL loading conflicts on Windows.
-        # IsaacLab loads DLLs that interfere with mujoco's plugin initialization.
-        try:
-            import mujoco  # noqa: F401
-        except ImportError:
-            pass  # mujoco is optional
-
         # Import isaaclab base module to ensure it's loaded before torch
         from isaaclab.app import AppLauncher
 
