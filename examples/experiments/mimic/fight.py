@@ -104,8 +104,13 @@ OBS_IN_KEYS = [
 
 
 def terrain_config(args: argparse.Namespace):
-    """Build terrain configuration."""
-    return TerrainConfig()
+    """Build terrain configuration.
+
+    The fighting tiers train on flat ground and the policy reads obstacles through
+    ``collision_primitives``, never the height map, so the terrain observation is
+    switched off to avoid sampling and cloning it every step.
+    """
+    return TerrainConfig(terrain_obs_enabled=False)
 
 
 def scene_lib_config(args: argparse.Namespace):

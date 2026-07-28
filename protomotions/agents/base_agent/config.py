@@ -111,6 +111,19 @@ class BaseAgentConfig:
     task_reward_w: float = field(default=1.0, metadata={"help": "Task reward weight."})
     num_mini_epochs: int = field(default=1, metadata={"help": "Mini-epochs per update."})
 
+    buffer_only_consumed_obs: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Only store environment observations the algorithm actually reads "
+                "(model.in_keys plus BaseAgent.extra_buffer_obs_keys()). Environments "
+                "emit observations no policy consumes -- e.g. the terrain heightmap -- "
+                "and storing them costs experience-buffer memory and per-minibatch "
+                "gather work for nothing. Set False to store every emitted key."
+            )
+        },
+    )
+
     training_early_termination: Optional[int] = field(
         default=None, metadata={"help": "Stop early at this step. None=disabled."}
     )

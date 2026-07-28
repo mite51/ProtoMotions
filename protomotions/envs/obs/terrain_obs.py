@@ -42,6 +42,11 @@ class TerrainObs:
     def __init__(self, config: TerrainConfig, env: BaseEnv):
         self.config = config
         self.env = env
+        self.enabled = config.terrain_obs_enabled
+
+        if not self.enabled:
+            self.terrain_obs = None
+            return
 
         self.terrain_obs = torch.zeros(
             self.env.num_envs,
@@ -56,6 +61,8 @@ class TerrainObs:
         Args:
             env_ids: Environment indices to update
         """
+        if not self.enabled:
+            return
         root_states = self.env.simulator.get_root_state(env_ids)
         # The terrain's per-env height-point grid is sized by the physical scene
         # count (E) and identical across envs. With multi-character self-play the
@@ -72,6 +79,9 @@ class TerrainObs:
         """Get terrain observations dictionary.
 
         Returns:
-            Dictionary with 'terrain' key containing height maps
+            Dictionary with 'terrain' key containing height maps, or empty when
+            terrain observations are disabled.
         """
+        if not self.enabled:
+            return {}
         return {"terrain": self.terrain_obs.clone()}

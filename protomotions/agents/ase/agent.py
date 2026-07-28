@@ -301,16 +301,19 @@ class ASE(AMP):
     @torch.no_grad()
     def compute_advantages(self):
         advantages_dict = super().compute_advantages()
-        dones = self.experience_buffer.dones
+        # Buffers are stored env-major; GAE needs time on dim 0 (see
+        # ExperienceBuffer.time_major). Results are transposed back to env-major.
+        tm = self.experience_buffer.time_major
+        dones = tm("dones")
 
         if self.config.normalize_rewards:
-            mi_rewards = self.experience_buffer.unnormalized_mi_rewards
-            mi_values = self.experience_buffer.unnormalized_mi_value.squeeze(-1)
-            mi_next_values = self.experience_buffer.unnormalized_next_mi_value.squeeze(-1)
+            mi_rewards = tm("unnormalized_mi_rewards")
+            mi_values = tm("unnormalized_mi_value").squeeze(-1)
+            mi_next_values = tm("unnormalized_next_mi_value").squeeze(-1)
         else:
-            mi_rewards = self.experience_buffer.mi_rewards
-            mi_values = self.experience_buffer.mi_value.squeeze(-1)
-            mi_next_values = self.experience_buffer.next_mi_value.squeeze(-1)
+            mi_rewards = tm("mi_rewards")
+            mi_values = tm("mi_value").squeeze(-1)
+            mi_next_values = tm("next_mi_value").squeeze(-1)
 
         mi_advantages = discount_values(
             dones, mi_values, mi_rewards, mi_next_values, self.gamma, self.tau
@@ -320,11 +323,13 @@ class ASE(AMP):
         if self.config.normalize_rewards:
             mi_returns = self.running_mi_enc_norm.normalize(mi_returns)
 
-        self.experience_buffer.batch_update_data("mi_returns", mi_returns)
+        self.experience_buffer.batch_update_data(
+            "mi_returns", mi_returns.transpose(0, 1)
+        )
 
         advantages_dict["advantages"] = (
             advantages_dict["advantages"]
-            + mi_advantages * self.config.ase_parameters.mi_reward_w
+            + mi_advantages.transpose(0, 1) * self.config.ase_parameters.mi_reward_w
         )
         return advantages_dict
 

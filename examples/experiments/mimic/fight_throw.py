@@ -149,14 +149,16 @@ def configure_robot_and_simulator(
     # interference. Ramp speed/prob back up via --overrides once the policy is robust.
     # Mixed primitive shapes (box/sphere/capsule) with randomized orientation, so the
     # policy learns to brace for arbitrary colliders, not just cubes. Each pool slot is
-    # one shape (round-robin), so num_projectiles=6 gives two of each. All three are
-    # captured by the collision_primitives obs (radius/extent_z/shape), so the frozen
-    # observation layout is unchanged.
+    # one shape (round-robin), so num_projectiles=3 gives exactly one of each; throws
+    # stay shape-randomized because the slot is picked at random. Every extra slot costs
+    # num_envs rigid bodies in the physics broadphase on every substep, so the pool is
+    # kept minimal. All three shapes are captured by the collision_primitives obs
+    # (radius/extent_z/shape), so the frozen observation layout is unchanged.
     simulator_cfg.projectile = ProjectileConfig(
         auto_throw_enabled=True,
         auto_throw_prob=AUTO_THROW_PROB,
         speed_range=(12.0, 22.0),
         density=300.0,
         shapes=("box", "sphere", "capsule"),
-        num_projectiles=6,
+        num_projectiles=3,
     )

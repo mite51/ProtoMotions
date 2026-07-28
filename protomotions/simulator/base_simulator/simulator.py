@@ -423,9 +423,17 @@ class Simulator(RecordingMixin, ABC):
         raise NotImplementedError
 
     def _init_projectiles(self) -> None:
-        """Initialize projectile pool state and create physics bodies."""
+        """Initialize projectile pool state and create physics bodies.
+
+        With no projectile config the pool is empty and no rigid bodies are spawned.
+        A populated pool costs ``num_projectiles * num_envs`` extra rigid bodies in
+        the physics broadphase on every substep, so experiments that never throw
+        must not pay for one.
+        """
         configured = getattr(self.config, "projectile", None)
-        self._proj_config = configured if configured is not None else ProjectileConfig()
+        self._proj_config = (
+            configured if configured is not None else ProjectileConfig(num_projectiles=0)
+        )
         N = self._proj_config.num_projectiles
 
         # Projectiles are a per-physical-scene resource (one pool per scene, shared by
@@ -438,6 +446,27 @@ class Simulator(RecordingMixin, ABC):
             (self.num_physical_envs, N), float("-inf"), device=self.device
         )
         self._proj_sim_time = torch.zeros(self.num_physical_envs, device=self.device)
+
+        # Per-pool-index geometry is constant for the whole run, so build the obs
+        # encoding tensors once here. get_active_projectile_states() runs every step
+        # inside the observation path; rebuilding these from Python lists there would
+        # cost a host-to-device copy per step.
+        specs = self._proj_config.get_shape_specs()
+        self._proj_half_sizes = torch.tensor(
+            self._proj_config.get_sizes(), device=self.device, dtype=torch.float
+        )
+        self._proj_radius = torch.tensor(
+            [s.radius for s in specs], device=self.device, dtype=torch.float
+        )
+        self._proj_extent_z = torch.tensor(
+            [s.extent_z for s in specs], device=self.device, dtype=torch.float
+        )
+        self._proj_shape = torch.tensor(
+            [list(s.shape_onehot) for s in specs], device=self.device, dtype=torch.float
+        ).reshape(N, 2)
+
+        if N == 0:
+            return
 
         # Non-box shapes are only realized on backends that build per-slot primitive
         # geometry. Elsewhere the colliders are boxes even though the obs still reports
@@ -473,6 +502,8 @@ class Simulator(RecordingMixin, ABC):
             env_ids: Environments to throw in. None == all environments.
         """
         cfg = self._proj_config
+        if cfg.num_projectiles == 0:
+            return
         if env_ids is None:
             env_ids = torch.arange(self.num_physical_envs, device=self.device)
         if env_ids.numel() == 0:
@@ -574,34 +605,21 @@ class Simulator(RecordingMixin, ABC):
         """
         positions, rotations = self._get_projectile_positions_rotations()
         active = (self._proj_throw_time > float("-inf")).to(positions.dtype)
-        half_sizes = torch.tensor(
-            self._proj_config.get_sizes(), device=self.device, dtype=positions.dtype
-        )
-        # Per-pool-index shape encoding (matches the collision_primitives obs layout).
-        specs = self._proj_config.get_shape_specs()
-        radius = torch.tensor(
-            [s.radius for s in specs], device=self.device, dtype=positions.dtype
-        )
-        extent_z = torch.tensor(
-            [s.extent_z for s in specs], device=self.device, dtype=positions.dtype
-        )
-        shape = torch.tensor(
-            [list(s.shape_onehot) for s in specs],
-            device=self.device,
-            dtype=positions.dtype,
-        )
+        # Geometry tensors are precomputed in _init_projectiles (constant per run).
         return {
             "positions": positions,
             "rotations": rotations,
             "active": active,
-            "half_sizes": half_sizes,
-            "radius": radius,
-            "extent_z": extent_z,
-            "shape": shape,
+            "half_sizes": self._proj_half_sizes,
+            "radius": self._proj_radius,
+            "extent_z": self._proj_extent_z,
+            "shape": self._proj_shape,
         }
 
     def _update_projectiles(self) -> None:
         """Timer-based hiding of expired projectiles."""
+        if self._proj_config.num_projectiles == 0:
+            return
         self._proj_sim_time += self.dt
         elapsed = self._proj_sim_time.unsqueeze(1) - self._proj_throw_time
         expired_mask = (elapsed > self._proj_config.hide_delay) & (
@@ -624,6 +642,8 @@ class Simulator(RecordingMixin, ABC):
 
     def _reset_projectiles(self, env_ids: torch.Tensor) -> None:
         """Reset projectile state on environment reset."""
+        if self._proj_config.num_projectiles == 0:
+            return
         self._proj_sim_time[env_ids] = 0.0
         self._proj_throw_time[env_ids] = float("-inf")
         self._proj_next_idx[env_ids] = 0
@@ -637,6 +657,8 @@ class Simulator(RecordingMixin, ABC):
     def _hide_projectiles_for_envs(self, env_ids: torch.Tensor) -> None:
         """Move all projectiles for given envs underground."""
         N = self._proj_config.num_projectiles
+        if N == 0:
+            return
         num_e = len(env_ids)
 
         # Expand: each env x each projectile

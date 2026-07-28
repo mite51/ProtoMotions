@@ -122,14 +122,14 @@ class IsaacLabSimulator(Simulator):
 
         # Pre-create projectile config (needed before _init_projectiles runs). Use the
         # configured projectile pool so the scene spawns the right count and shapes;
-        # _init_projectiles later assigns this same config. Falling back to the default
-        # here would build a mismatched pool (e.g. wrong num_projectiles) and later
-        # index past the created objects.
+        # _init_projectiles later derives this same config. A mismatch here would build
+        # the wrong number of rigid bodies and later index past the created objects.
+        # With no config the pool is empty, so no projectile bodies are spawned at all.
         configured_projectile = getattr(self.config, "projectile", None)
         self._proj_config = (
             configured_projectile
             if configured_projectile is not None
-            else ProjectileConfig()
+            else ProjectileConfig(num_projectiles=0)
         )
 
         scene_cfg = self._get_scene_cfg()

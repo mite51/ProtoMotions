@@ -182,13 +182,10 @@ RUN pip install gdown \
 # and any terminal-aware tools work cleanly.
 ENV TERM=xterm
 
-# Entrypoint script is staged into the image but NOT wired up as ENTRYPOINT
-# yet — building on Windows produces CRLF line endings that break the
-# shebang on Linux ("No such file or directory"). To enable later, either:
-#   1) Add `* text=auto eol=lf` for *.sh in .gitattributes and re-clone, or
-#   2) Run `dos2unix entrypoint.sh` before COPY, or
-#   3) Build on Linux/WSL.
-# Staged at /opt/ (not /workspace/) so RunPod's volume mount doesn't hide it.
+# Entrypoint script is staged into the image but NOT wired up as ENTRYPOINT;
+# start-runpod.sh below is what actually runs. Staged at /opt/ (not
+# /workspace/) so RunPod's volume mount doesn't hide it. Its line endings are
+# normalized together with start-runpod.sh further down.
 COPY entrypoint.sh /opt/entrypoint.sh
 
 # sshd configuration: allow root login via key only, never via password.
@@ -203,9 +200,10 @@ RUN mkdir -p /var/run/sshd /root/.ssh \
         -e 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' \
         /etc/ssh/sshd_config
 
-# RunPod start script — written via BuildKit heredoc so it always has LF
-# line endings (avoids the Windows CRLF -> "No such file or directory"
-# problem we hit with the original entrypoint.sh).
+# RunPod start script — written via BuildKit heredoc. The heredoc body is
+# copied verbatim from this Dockerfile, so on a Windows/CRLF checkout the
+# script lands with \r line endings and the shebang fails as
+# "/bin/bash^M: bad interpreter". The sed pass below strips them.
 #
 # Behavior on every container start:
 #   1) ensure ssh host keys exist
@@ -232,6 +230,9 @@ mkdir -p /var/run/sshd
 # `-e` writes logs to stderr so they show in `docker logs` / RunPod logs.
 exec /usr/sbin/sshd -D -e
 EOF
+
+RUN sed -i 's/\r$//' /usr/local/bin/start-runpod.sh /opt/entrypoint.sh \
+    && chmod +x /usr/local/bin/start-runpod.sh /opt/entrypoint.sh
 
 # Document the SSH port (the actual publish/expose is configured in the
 # RunPod template's "Expose TCP Ports" field; add 22 there).

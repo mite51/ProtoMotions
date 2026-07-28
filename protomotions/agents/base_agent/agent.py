@@ -41,7 +41,7 @@ import torch.nn as nn
 import time
 import math
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 from lightning.fabric import Fabric
 from tensordict import TensorDict
@@ -410,8 +410,11 @@ class BaseAgent:
         obs = self.add_agent_info_to_obs(obs)
         obs_td = self.obs_dict_to_tensordict(obs)
 
-        # Register environment observation keys
-        for key, env_tensor in obs_td.items():
+        # Register environment observation keys. By default only those the algorithm
+        # reads are stored; see BaseAgentConfig.buffer_only_consumed_obs.
+        self._buffered_obs_keys = self.select_buffered_obs_keys(list(obs_td.keys()))
+        for key in self._buffered_obs_keys:
+            env_tensor = obs_td[key]
             shape = env_tensor.shape
             dtype = env_tensor.dtype
             self.experience_buffer.register_key(key, shape=shape[1:], dtype=dtype)
@@ -466,8 +469,8 @@ class BaseAgent:
                     obs_td = self.obs_dict_to_tensordict(obs)
 
                     # Store observations in the experience buffer
-                    for key, env_tensor in obs_td.items():
-                        self.experience_buffer.update_data(key, step, env_tensor)
+                    for key in self._buffered_obs_keys:
+                        self.experience_buffer.update_data(key, step, obs_td[key])
 
                     actor_output = self.collect_rollout_step(obs_td, step)
                     self.check_for_nans(obs_td, actor_output)
@@ -587,6 +590,41 @@ class BaseAgent:
         with agent-specific information (e.g., latent codes, discriminator obs).
         """
         return obs
+
+    def extra_buffer_obs_keys(self) -> List[str]:
+        """Environment observation keys the algorithm needs beyond ``model.in_keys``.
+
+        Subclasses that read observations outside the actor/critic forward pass (e.g.
+        AMP's discriminator, which pulls its inputs straight from the dataset) must
+        list them here so they survive experience-buffer filtering.
+        """
+        return []
+
+    def select_buffered_obs_keys(self, available_keys: List[str]) -> List[str]:
+        """Choose which environment observation keys to store in the experience buffer.
+
+        Environments emit observations no algorithm consumes (the terrain heightmap is
+        emitted unconditionally, for instance). Each stored key costs buffer memory and
+        is gathered and NaN-scanned in every minibatch, so by default only consumed keys
+        are kept. Order follows ``available_keys`` for stable registration.
+        """
+        if not self.config.buffer_only_consumed_obs:
+            return list(available_keys)
+
+        wanted = set(self.model.in_keys) | set(self.extra_buffer_obs_keys())
+        selected = [key for key in available_keys if key in wanted]
+
+        missing = wanted - set(available_keys)
+        if missing:
+            raise KeyError(
+                f"Algorithm requires observation keys the environment does not emit: "
+                f"{sorted(missing)}. Available: {sorted(available_keys)}"
+            )
+
+        skipped = [key for key in available_keys if key not in wanted]
+        if skipped:
+            log.info(f"Not buffering unused environment observations: {skipped}")
+        return selected
 
     def obs_dict_to_tensordict(self, obs_dict: Dict) -> TensorDict:
         """Convert observation dict to TensorDict.

@@ -32,14 +32,16 @@ import torch
 from torch import Tensor, nn
 from torch.utils.data import Dataset
 from typing import Dict
-import numpy as np
 
 
 def swap_and_flatten01(arr: Tensor):
     """Swap and flatten first two dimensions of a tensor.
 
     Converts (num_steps, num_envs, ...) to (num_steps * num_envs, ...).
-    Commonly used to batch experience from parallel environments.
+
+    Note:
+        ``ExperienceBuffer`` no longer uses this: it stores env-major so that
+        flattening is a free view. Kept for callers holding time-major data.
 
     Args:
         arr: Tensor with at least 2 dimensions.
@@ -84,15 +86,23 @@ class ExperienceBuffer(nn.Module):
     def register_key(self, key: str, shape=(), dtype=torch.float):
         assert not hasattr(self, key), key
         buffer = torch.zeros(
-            (self.num_steps, self.num_envs) + shape, dtype=dtype, device=self._device
+            (self.num_envs, self.num_steps) + shape, dtype=dtype, device=self._device
         )
         self.register_buffer(key, buffer, persistent=False)
         self.store_dict[key] = 0
 
     def update_data(self, key: str, index: int, data: Tensor):
         assert not data.requires_grad
-        getattr(self, key)[index] = data
+        getattr(self, key)[:, index] = data
         self.store_dict[key] += index + 1
+
+    def time_major(self, key: str) -> Tensor:
+        """Return a ``(num_steps, num_envs, ...)`` view of a buffer.
+
+        Buffers are stored env-major so ``make_dict`` can flatten for free, but GAE
+        walks backwards over time on dim 0. This is a view, not a copy.
+        """
+        return getattr(self, key).transpose(0, 1)
 
     def total_sum(self):
         return (self.num_steps + 1) * (self.num_steps / 2)
@@ -103,7 +113,18 @@ class ExperienceBuffer(nn.Module):
         self.store_dict[key] = self.total_sum()
 
     def make_dict(self):
-        data = {k: swap_and_flatten01(v) for k, v in self.named_buffers()}
+        """Return flattened ``(num_envs * num_steps, ...)`` views and clear write counts.
+
+        Buffers are stored env-major precisely so this reshape is a free view. Storing
+        time-major instead would require ``transpose(0, 1).reshape(...)``, which is
+        non-contiguous and forces a full duplicate of every buffer to be materialized
+        for the whole training phase. Row ordering is unchanged either way: row ``r``
+        is env ``r // num_steps`` at step ``r % num_steps``.
+        """
+        data = {
+            k: v.reshape(self.num_envs * self.num_steps, *v.shape[2:])
+            for k, v in self.named_buffers()
+        }
         for k, v in self.store_dict.items():
             assert v == self.total_sum(), f"Problem with '{k}', {v}, {self.total_sum()}"
             self.store_dict[k] = 0
@@ -148,13 +169,18 @@ class DictDataset(Dataset):
         ), f"{self.num_tensors} {self.batch_size}"
         self.tensor_dict = tensor_dict
         self.do_shuffle = shuffle
-        self.shuffled_to_original = np.arange(self.num_tensors)
+        # Keep indices on the same device as the data. A numpy index array would be
+        # copied host-to-device on every key of every minibatch fetch.
+        self._device = next(iter(tensor_dict.values())).device
+        self.shuffled_to_original = torch.arange(self.num_tensors, device=self._device)
 
         if shuffle:
             self.shuffle()
 
     def shuffle(self):
-        self.shuffled_to_original = np.random.permutation(self.num_tensors)
+        self.shuffled_to_original = torch.randperm(
+            self.num_tensors, device=self._device
+        )
 
     def num_batches(self):
         return self.num_tensors // self.batch_size

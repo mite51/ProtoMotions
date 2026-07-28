@@ -642,16 +642,19 @@ class PPO(BaseAgent):
     @torch.no_grad()
     def compute_advantages(self):
         """Compute GAE advantages and returns, storing them in experience buffer."""
-        dones = self.experience_buffer.dones
+        # GAE walks backwards over time, so read time-major views of the env-major
+        # buffers. These are views; the results are transposed back before storing.
+        tm = self.experience_buffer.time_major
+        dones = tm("dones")
 
         if self.config.normalize_rewards:
-            rewards = self.experience_buffer.unnormalized_rewards
-            values = self.experience_buffer.unnormalized_value.squeeze(-1)
-            next_values = self.experience_buffer.unnormalized_next_value.squeeze(-1)
+            rewards = tm("unnormalized_rewards")
+            values = tm("unnormalized_value").squeeze(-1)
+            next_values = tm("unnormalized_next_value").squeeze(-1)
         else:
-            rewards = self.experience_buffer.rewards
-            values = self.experience_buffer.value.squeeze(-1)
-            next_values = self.experience_buffer.next_value.squeeze(-1)
+            rewards = tm("rewards")
+            values = tm("value").squeeze(-1)
+            next_values = tm("next_value").squeeze(-1)
 
         advantages = discount_values(
             dones, values, rewards, next_values, self.gamma, self.tau
@@ -664,8 +667,8 @@ class PPO(BaseAgent):
         assert torch.all(torch.isfinite(returns)), f"Returns are not finite: {returns}"
 
         return {
-            "returns": returns,
-            "advantages": advantages * self.config.task_reward_w,
+            "returns": returns.transpose(0, 1),
+            "advantages": (advantages * self.config.task_reward_w).transpose(0, 1),
         }
 
     @torch.no_grad()

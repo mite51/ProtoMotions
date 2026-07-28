@@ -155,6 +155,11 @@ class AMP(PPO):
     # -----------------------------
     # Experience Buffer and Dataset Processing
     # -----------------------------
+    def extra_buffer_obs_keys(self):
+        """Discriminator inputs are read straight from the dataset in process_dataset,
+        so they must be buffered even though they are not actor/critic inputs."""
+        return list(self.model._discriminator.in_keys)
+
     def register_algorithm_experience_buffer_keys(self):
         super().register_algorithm_experience_buffer_keys()
         self.experience_buffer.register_key("amp_rewards")
@@ -370,16 +375,19 @@ class AMP(PPO):
     @torch.no_grad()
     def compute_advantages(self):
         advantages_dict = super().compute_advantages()
-        dones = self.experience_buffer.dones
+        # Buffers are stored env-major; GAE needs time on dim 0 (see
+        # ExperienceBuffer.time_major). Results are transposed back to env-major.
+        tm = self.experience_buffer.time_major
+        dones = tm("dones")
 
         if self.config.normalize_rewards:
-            disc_rewards = self.experience_buffer.unnormalized_amp_rewards
-            disc_values = self.experience_buffer.unnormalized_disc_value.squeeze(-1)
-            disc_next_values = self.experience_buffer.unnormalized_next_disc_value.squeeze(-1)
+            disc_rewards = tm("unnormalized_amp_rewards")
+            disc_values = tm("unnormalized_disc_value").squeeze(-1)
+            disc_next_values = tm("unnormalized_next_disc_value").squeeze(-1)
         else:
-            disc_rewards = self.experience_buffer.amp_rewards
-            disc_values = self.experience_buffer.disc_value.squeeze(-1)
-            disc_next_values = self.experience_buffer.next_disc_value.squeeze(-1)
+            disc_rewards = tm("amp_rewards")
+            disc_values = tm("disc_value").squeeze(-1)
+            disc_next_values = tm("next_disc_value").squeeze(-1)
 
         disc_advantages = discount_values(
             dones, disc_values, disc_rewards, disc_next_values, self.gamma, self.tau
@@ -389,11 +397,14 @@ class AMP(PPO):
         if self.config.normalize_rewards:
             disc_returns = self.running_amp_reward_norm.normalize(disc_returns)
 
-        self.experience_buffer.batch_update_data("disc_returns", disc_returns)
+        self.experience_buffer.batch_update_data(
+            "disc_returns", disc_returns.transpose(0, 1)
+        )
 
         advantages_dict["advantages"] = (
             advantages_dict["advantages"]
-            + disc_advantages * self.config.amp_parameters.discriminator_reward_w
+            + disc_advantages.transpose(0, 1)
+            * self.config.amp_parameters.discriminator_reward_w
         )
         return advantages_dict
 
