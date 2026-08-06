@@ -334,7 +334,7 @@ sidecar also carries them as `default_joint_stiffness/damping`).
 **Inputs** are the bound context attribute paths (sanitized: `.`→`_`). For the fight
 model these include, in addition to the stock tracker inputs:
 
-- `collision_primitives.pos|rot|lin_vel|radius|extent_z|damage|shape|valid`
+- `collision_primitives.pos|rot|lin_vel|radius|extent_z|damage|mass|shape|valid`
 - `body_stamina`
 - `current.rigid_body_vel` (collision-primitive obs uses body velocity)
 
@@ -344,8 +344,9 @@ model these include, in addition to the stock tracker inputs:
 tracing resolves them (shapes for `num_envs=1`):
 
 - `mock.collision_primitives` with `.pos [1,M,3]`, `.rot [1,M,4]`, `.lin_vel [1,M,3]`,
-  `.radius [1,M]`, `.extent_z [1,M]`, `.damage [1,M]`, `.shape [1,M,2]`, `.valid [1,M]`
-  (`M = env_config.max_collision_primitives`).
+  `.radius [1,M]`, `.extent_z [1,M]`, `.damage [1,M]`, `.mass [1,M]`, `.shape [1,M,2]`,
+  `.valid [1,M]` (`M = env_config.max_collision_primitives`). `mass` is a selection
+  input only (not part of the 17-float obs layout) but must still be fed to ONNX.
 - `mock.body_stamina [1, num_stamina_bodies]` where `num_stamina_bodies =
   len(robot_config.kinematic_info.hinge_axes_map)`.
 - `mock.body_contacts [1, num_contact_bodies]` sized to the **frozen contact-body

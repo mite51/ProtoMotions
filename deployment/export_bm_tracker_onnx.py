@@ -217,6 +217,9 @@ class _MockCollisionPrimitives:
         self.radius   = torch.rand(num_envs, m)
         self.extent_z = torch.rand(num_envs, m)
         self.damage   = torch.rand(num_envs, m)
+        # Mass is used only for selection scoring (not emitted in the 17-float
+        # layout); must still be present so dynamic_vars resolve during tracing.
+        self.mass     = torch.ones(num_envs, m)
         self.shape    = torch.zeros(num_envs, m, 2)
         self.valid    = torch.ones(num_envs, m)
 
