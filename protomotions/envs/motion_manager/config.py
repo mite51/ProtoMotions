@@ -76,3 +76,56 @@ class MimicMotionManagerConfig(MotionManagerConfig):
         default=True,
         metadata={"help": "Whether to resample motion on environment reset."}
     )
+
+    smooth_realign_enabled: bool = False
+
+    # --- Smooth velocity-error re-anchoring ---------------------------------
+    # When realign_motion_with_humanoid_on_each_step is enabled, the reference XY
+    # offset is not snapped instantly to the character each step. Instead it is
+    # blended toward the character with a strength proportional to the
+    # "unexpected" root XY velocity (||current_xy_vel - ref_xy_vel||). This lets
+    # an external shove/slide re-anchor the reference (so it stays reachable)
+    # while a character tracking the clip velocity leaves the offset stable --
+    # important for balance-critical clips like getup. See fight.py / the
+    # deployment doc for the exact contract.
+    realign_alpha_min: float = field(
+        default=0.0,
+        metadata={
+            "help": "Blend factor when velocity error <= realign_vel_err_low (0 == frozen offset).",
+            "min": 0.0,
+            "max": 1.0,
+        },
+    )
+
+    realign_alpha_max: float = field(
+        default=0.4,
+        metadata={
+            "help": "Blend factor when velocity error >= realign_vel_err_high.",
+            "min": 0.0,
+            "max": 1.0,
+        },
+    )
+
+    realign_vel_err_low: float = field(
+        default=0.3,
+        metadata={
+            "help": "Root XY velocity error (m/s) below which re-anchoring uses realign_alpha_min.",
+            "min": 0.0,
+        },
+    )
+
+    realign_vel_err_high: float = field(
+        default=1.5,
+        metadata={
+            "help": "Root XY velocity error (m/s) at/above which re-anchoring uses realign_alpha_max.",
+            "min": 0.0,
+        },
+    )
+
+    realign_max_xy_speed: float = field(
+        default=2.0,
+        metadata={
+            "help": "Cap (m/s) on how fast the reference XY offset may change per step.",
+            "min": 0.0,
+        },
+    )

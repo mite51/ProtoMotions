@@ -953,32 +953,40 @@ class MotionLib:
         # Smooth each motion independently to respect motion boundaries
         smoothed_contacts = torch.zeros_like(self.contacts, dtype=torch.float32)
 
-        for motion_idx in range(num_motions):
-            # Get the range for this motion
-            start_idx = self.length_starts[motion_idx].item()
-            num_frames = self.motion_num_frames[motion_idx].item()
-            end_idx = start_idx + num_frames
+        # Clip lengths vary: cuDNN autotuning every length can take minutes on
+        # large AMASS libraries. Keep the same convolution and restore training's
+        # setting even if preprocessing fails.
+        old_benchmark = torch.backends.cudnn.benchmark
+        try:
+            torch.backends.cudnn.benchmark = False
+            for motion_idx in range(num_motions):
+                # Get the range for this motion
+                start_idx = self.length_starts[motion_idx].item()
+                num_frames = self.motion_num_frames[motion_idx].item()
+                end_idx = start_idx + num_frames
 
-            # Extract contacts for this motion: [num_frames, num_bodies]
-            motion_contacts = self.contacts[start_idx:end_idx].float()
+                # Extract contacts for this motion: [num_frames, num_bodies]
+                motion_contacts = self.contacts[start_idx:end_idx].float()
 
-            # Reshape for conv1d: [num_bodies, 1, num_frames]
-            contacts_for_conv = motion_contacts.t().unsqueeze(1)
+                # Reshape for conv1d: [num_bodies, 1, num_frames]
+                contacts_for_conv = motion_contacts.t().unsqueeze(1)
 
-            # Manually apply replicate padding (functional conv1d doesn't support padding_mode)
-            padded_contacts = torch.nn.functional.pad(
-                contacts_for_conv,
-                (padding, padding),  # pad left and right
-                mode="replicate",
-            )
+                # Manually apply replicate padding (functional conv1d doesn't support padding_mode)
+                padded_contacts = torch.nn.functional.pad(
+                    contacts_for_conv,
+                    (padding, padding),  # pad left and right
+                    mode="replicate",
+                )
 
-            # Apply 1D convolution (no padding needed since we already padded)
-            smoothed_motion = torch.nn.functional.conv1d(
-                padded_contacts, kernel, padding=0
-            )
+                # Apply 1D convolution (no padding needed since we already padded)
+                smoothed_motion = torch.nn.functional.conv1d(
+                    padded_contacts, kernel, padding=0
+                )
 
-            # Reshape back to [num_frames, num_bodies] and store
-            smoothed_contacts[start_idx:end_idx] = smoothed_motion.squeeze(1).t()
+                # Reshape back to [num_frames, num_bodies] and store
+                smoothed_contacts[start_idx:end_idx] = smoothed_motion.squeeze(1).t()
+        finally:
+            torch.backends.cudnn.benchmark = old_benchmark
 
         # Replace contacts with smoothed version
         self.contacts = smoothed_contacts

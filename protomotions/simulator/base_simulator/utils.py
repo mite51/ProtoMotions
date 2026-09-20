@@ -34,6 +34,35 @@ def get_friction_table(friction_dr: Dict[str, Any]) -> Optional[torch.Tensor]:
         return static_friction
     return friction_dr.get("dynamic_friction")
 
+def character_spawn_offsets(
+    num_characters: int, radius: float = 1.0
+) -> List[Tuple[float, float]]:
+    """Per-character XY spawn offsets within a shared physical scene.
+
+    For multi-character self-play, the N articulations in one scene must be spawned
+    apart so they don't interpenetrate at reset but are close enough to interact.
+    Characters are placed on a circle of the given ``radius`` (a single character is
+    centered). The same offsets are used by the IsaacLab scene's initial articulation
+    poses and by the environment's per-character reset offset, so a character's row
+    ``r`` maps to offset index ``r % num_characters``.
+
+    Args:
+        num_characters: Number of characters per scene (N >= 1).
+        radius: Circle radius in meters.
+
+    Returns:
+        List of (x, y) offset tuples, length ``num_characters``.
+    """
+    import math
+
+    if num_characters <= 1:
+        return [(0.0, 0.0)]
+    offsets = []
+    for c in range(num_characters):
+        angle = 2.0 * math.pi * c / num_characters
+        offsets.append((radius * math.cos(angle), radius * math.sin(angle)))
+    return offsets
+
 
 def build_motion_data(
     recorded_motion: Dict[str, List[torch.Tensor]],

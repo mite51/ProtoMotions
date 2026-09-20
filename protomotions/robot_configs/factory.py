@@ -8,7 +8,8 @@ def robot_config(robot_name: str, **updates) -> RobotConfig:
     """Factory function to create robot configuration based on robot type.
 
     Args:
-        robot_name: Name of the robot type (smpl, smplx, amp, g1, h1_2, soma23)
+        robot_name: Name of the robot type (smpl, smpl-proportional, smplx, amp,
+            g1, h1_2, soma23, rigv1)
         **updates: Optional field updates to apply to the robot config
 
     Returns:
@@ -21,6 +22,12 @@ def robot_config(robot_name: str, **updates) -> RobotConfig:
         from protomotions.robot_configs.smpl import SmplRobotConfig
 
         config = SmplRobotConfig()
+    elif robot_name == "smpl-proportional":
+        from protomotions.robot_configs.smpl_proportional import (
+            SmplProportionalRobotConfig,
+        )
+
+        config = SmplProportionalRobotConfig()
     elif robot_name == "smplx":
         from protomotions.robot_configs.smplx import SMPLXRobotConfig
 

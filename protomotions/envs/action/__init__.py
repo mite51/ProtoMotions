@@ -10,7 +10,9 @@ from protomotions.envs.action.action_functions import (
     make_bm_pd_action_config,
     make_passthrough_pd_action_config,
     make_pd_action_config,
+    make_pd_stamina_action_config,
     normalized_pd_fixed_gains_action,
+    normalized_pd_stamina_action,
     passthrough_pd_action,
 )
 
@@ -21,6 +23,8 @@ __all__ = [
     "make_bm_pd_action_config",
     "make_passthrough_pd_action_config",
     "make_pd_action_config",
+    "make_pd_stamina_action_config",
     "normalized_pd_fixed_gains_action",
+    "normalized_pd_stamina_action",
     "passthrough_pd_action",
 ]

@@ -97,6 +97,16 @@ class TerrainConfig:
         default=0.9,
         metadata={"help": "Maximum slope angle threshold.", "min": 0.0, "max": 1.0}
     )
+    terrain_obs_enabled: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Emit the 'terrain' height-map observation. Sampling the height map "
+                "and cloning it costs time every step even on flat ground, so "
+                "experiments whose policies do not consume 'terrain' should disable it."
+            )
+        },
+    )
     num_samples_per_axis: int = field(
         default=16,
         metadata={"help": "Samples per axis for height observation.", "min": 1}

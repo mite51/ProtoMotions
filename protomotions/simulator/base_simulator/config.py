@@ -474,8 +474,33 @@ class PushDomainRandomizationConfig:
 
 
 @dataclass
+class ProjectileShapeSpec:
+    """Per-pool-index projectile shape + its collision-primitive obs encoding.
+
+    ``radius``/``extent_z``/``shape_onehot`` mirror the ``collision_primitives``
+    17-float layout exactly (see ``protomotions/envs/obs/collision_primitives.py``):
+    ``radius`` = sphere/capsule radius (0 for box), ``extent_z`` = box full height /
+    capsule cylinder length (0 for sphere), ``shape_onehot`` = ``[is_box, is_sphere]``
+    (capsule == ``[0, 0]``). Geometry is derived from the same fields: box size ==
+    ``(extent_z,)*3``, sphere radius == ``radius``, capsule == ``radius`` + height
+    ``extent_z``.
+    """
+
+    shape_type: str  # "box" | "sphere" | "capsule"
+    radius: float
+    extent_z: float
+    shape_onehot: Tuple[float, float]
+
+
+@dataclass
 class ProjectileConfig:
-    """Configuration for projectile cube throwing (J-key perturbation)."""
+    """Configuration for projectile throwing (J-key perturbation + auto-throw).
+
+    Projectiles can be a mix of primitive shapes (``shapes``); each pool index is
+    assigned a shape round-robin over ``shapes`` and thrown with a randomized
+    orientation. All shapes are captured by the ``collision_primitives`` observation
+    (via ``get_shape_specs()``), so mixing shapes needs no observation-layout change.
+    """
 
     num_projectiles: int = 0
     cube_half_size_range: Tuple[float, float] = (0.05, 0.15)  # per-pool-index size
@@ -491,6 +516,35 @@ class ProjectileConfig:
     hide_z: float = -2.0  # z-position when hidden
     hide_spacing: float = 4.0  # z-spacing between hidden projectile slots
 
+    # Primitive shapes to populate the pool with. Each pool index gets a shape
+    # round-robin over this tuple (e.g. ("box","sphere","capsule") -> box, sphere,
+    # capsule, box, ...). Default keeps the historical box-only behavior. Mixed
+    # geometry is realized on the IsaacLab backend; other backends fall back to box.
+    shapes: Tuple[str, ...] = ("box",)
+    # Optional per-shape size ranges (linearly interpolated across the pool). When
+    # None, sizes derive from ``cube_half_size_range`` (the single-knob default):
+    # sphere/capsule radius == the interpolated half-size ``s``; capsule cylinder
+    # length == ``2 * s``.
+    sphere_radius_range: Optional[Tuple[float, float]] = None
+    capsule_radius_range: Optional[Tuple[float, float]] = None
+    capsule_length_range: Optional[Tuple[float, float]] = None
+
+    # Automatic throwing during training (in addition to the J-key handler).
+    # When enabled, each environment independently throws a projectile on a given
+    # step with probability ``auto_throw_prob`` (per-env stochastic), so envs see
+    # varied interference. This is the Tier-2 "random colliders thrown at the
+    # character" curriculum knob -- ramp ``auto_throw_prob`` from 0 over training.
+    auto_throw_enabled: bool = False
+    auto_throw_prob: float = 0.0  # per-env, per-step throw probability in [0, 1]
+
+    def _interp(self, rng: Tuple[float, float], i: int) -> float:
+        """Linearly interpolate ``rng`` across the pool at index ``i``."""
+        lo, hi = rng
+        n = self.num_projectiles
+        if n <= 1:
+            return lo
+        return lo + (hi - lo) * i / (n - 1)
+
     def get_sizes(self) -> list:
         """Return per-pool-index half sizes, linearly interpolated."""
         lo, hi = self.cube_half_size_range
@@ -502,6 +556,45 @@ class ProjectileConfig:
     def hidden_z_for_index(self, projectile_index: int) -> float:
         """Return a hidden z-position that avoids projectile-projectile overlap."""
         return self.hide_z - self.hide_spacing * projectile_index
+
+    def get_shape_specs(self) -> List[ProjectileShapeSpec]:
+        """Return per-pool-index shape specs (geometry + obs encoding).
+
+        Shapes are assigned round-robin over ``shapes``. Sizes interpolate across the
+        pool via the per-shape ranges, or ``cube_half_size_range`` when a range is None.
+        """
+        shapes = self.shapes if self.shapes else ("box",)
+        specs: List[ProjectileShapeSpec] = []
+        for i in range(self.num_projectiles):
+            s = self._interp(self.cube_half_size_range, i)  # characteristic half-size
+            shape_type = shapes[i % len(shapes)]
+            if shape_type == "box":
+                specs.append(ProjectileShapeSpec("box", 0.0, 2.0 * s, (1.0, 0.0)))
+            elif shape_type == "sphere":
+                r = (
+                    self._interp(self.sphere_radius_range, i)
+                    if self.sphere_radius_range is not None
+                    else s
+                )
+                specs.append(ProjectileShapeSpec("sphere", r, 0.0, (0.0, 1.0)))
+            elif shape_type == "capsule":
+                r = (
+                    self._interp(self.capsule_radius_range, i)
+                    if self.capsule_radius_range is not None
+                    else s
+                )
+                h = (
+                    self._interp(self.capsule_length_range, i)
+                    if self.capsule_length_range is not None
+                    else 2.0 * s
+                )
+                specs.append(ProjectileShapeSpec("capsule", r, h, (0.0, 0.0)))
+            else:
+                raise ValueError(
+                    f"Unknown projectile shape '{shape_type}'; expected one of "
+                    "'box', 'sphere', 'capsule'."
+                )
+        return specs
 
 
 @dataclass
@@ -567,6 +660,27 @@ class SimulatorConfig:
     )
     num_envs: int = field(
         default=None, metadata={"help": "Number of parallel environments.", "min": 1}
+    )
+    num_characters: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Number of policy-controlled humanoid characters per physical "
+                "environment (multi-character self-play). When > 1, the simulator "
+                "spawns N articulations per scene that physically interact, and the "
+                "environment flattens them at the agent API so the RL agent sees "
+                "num_envs * num_characters independent rows (shared policy). "
+                "Default 1 == single-character (legacy behavior, exact no-op)."
+            ),
+            "min": 1,
+        },
+    )
+    character_spawn_radius: float = field(
+        default=1.0,
+        metadata={
+            "help": "Initial IsaacLab articulation-circle radius before the first environment reset.",
+            "min": 0.0,
+        },
     )
     sim: SimParams = field(
         default=None, metadata={"help": "Simulation parameters (fps, decimation)."}

@@ -94,6 +94,90 @@ def max_coords_obs_factory(
     )
 
 
+def collision_primitives_obs_factory(
+    num_obs_primitives: int = 6,
+    use_noisy: bool = False,
+    selection_range: float = 8.0,
+    distance_weight: float = 1.0,
+    closing_speed_weight: float = 1.0,
+    mass_weight: float = 0.25,
+    distance_scale: float = 2.0,
+    speed_scale: float = 10.0,
+    mass_scale: float = 10.0,
+) -> MdpComponent:
+    """Factory for the unified collision-primitive observation.
+
+    Emits the K highest-priority collision primitives (ground, obstacles,
+    projectiles, and other characters' key bodies) in the egocentric 17-float
+    layout. Priority combines range, body distance, closing speed, and mass.
+    Output width is ``num_obs_primitives * 17`` and is independent of the
+    candidate-buffer capacity (``EnvConfig.max_collision_primitives``), so this
+    width is part of the frozen observation architecture across all training tiers.
+
+    Args:
+        num_obs_primitives: K, number of prioritized primitives included in the obs.
+            Must be <= ``EnvConfig.max_collision_primitives``.
+        use_noisy: If True, use noisy robot state for the egocentric frame.
+
+    Returns:
+        MdpComponent configured for collision-primitive observations.
+    """
+    from protomotions.envs.obs import compute_collision_primitives_obs
+
+    state = EnvContext.noisy if use_noisy else EnvContext.current
+    primitives = EnvContext.collision_primitives
+
+    return MdpComponent(
+        compute_func=compute_collision_primitives_obs,
+        dynamic_vars={
+            "body_pos": state.rigid_body_pos,
+            "body_rot": state.rigid_body_rot,
+            "body_vel": state.rigid_body_vel,
+            "primitive_pos": primitives.pos,
+            "primitive_rot": primitives.rot,
+            "primitive_lin_vel": primitives.lin_vel,
+            "primitive_radius": primitives.radius,
+            "primitive_extent_z": primitives.extent_z,
+            "primitive_damage": primitives.damage,
+            "primitive_mass": primitives.mass,
+            "primitive_shape": primitives.shape,
+            "primitive_valid": primitives.valid,
+        },
+        static_params={
+            "num_obs_primitives": num_obs_primitives,
+            "selection_range": selection_range,
+            "distance_weight": distance_weight,
+            "closing_speed_weight": closing_speed_weight,
+            "mass_weight": mass_weight,
+            "distance_scale": distance_scale,
+            "speed_scale": speed_scale,
+            "mass_scale": mass_scale,
+            "w_last": True,
+        },
+    )
+
+
+def stamina_obs_factory() -> MdpComponent:
+    """Factory for the per-body stamina observation.
+
+    Emits one scalar per actuated body (current joint-drive strength, 1.0 == full).
+    Output width is the robot's actuated-body count and is part of the frozen
+    observation architecture. Include this from the Tier 1 base (stamina == 1.0,
+    inert) so later tiers that randomize stamina warm-start without an obs-shape
+    change.
+
+    Returns:
+        MdpComponent configured for the per-body stamina observation.
+    """
+    from protomotions.envs.obs import compute_stamina_obs
+
+    return MdpComponent(
+        compute_func=compute_stamina_obs,
+        dynamic_vars={"body_stamina": EnvContext.body_stamina},
+        static_params={},
+    )
+
+
 def reduced_coords_obs_factory(
     use_noisy: bool = False,
     root_height_obs: bool = False,
@@ -758,12 +842,21 @@ def action_smoothness_factory(weight: float = -0.02) -> MdpComponent:
     )
 
 
-def gt_rew_factory(weight: float = 0.5, coefficient: float = -100.0) -> MdpComponent:
+def gt_rew_factory(
+    weight: float = 0.5,
+    coefficient: float = -100.0,
+    mean_before_exp: bool = True,
+) -> MdpComponent:
     """Factory for position tracking reward.
 
     Args:
         weight: Reward weight.
         coefficient: Exponential coefficient for error.
+        mean_before_exp: If True (default), average per-body error before the
+            exponential (a single mis-tracked body is diluted). If False, average
+            after the exponential so each body contributes independently -- a
+            stronger per-body / extremity articulation signal. See
+            ``compute_gt_rew``.
 
     Returns:
         MdpComponent configured for position tracking.
@@ -776,16 +869,28 @@ def gt_rew_factory(weight: float = 0.5, coefficient: float = -100.0) -> MdpCompo
             "current_rigid_body_pos": EnvContext.current.rigid_body_pos,
             "ref_rigid_body_pos": EnvContext.mimic.ref_state.rigid_body_pos,
         },
-        static_params={"weight": weight, "coefficient": coefficient},
+        static_params={
+            "weight": weight,
+            "coefficient": coefficient,
+            "mean_before_exp": mean_before_exp,
+        },
     )
 
 
-def gr_rew_factory(weight: float = 0.3, coefficient: float = -5.0) -> MdpComponent:
+def gr_rew_factory(
+    weight: float = 0.3,
+    coefficient: float = -5.0,
+    mean_before_exp: bool = True,
+) -> MdpComponent:
     """Factory for rotation tracking reward.
 
     Args:
         weight: Reward weight.
         coefficient: Exponential coefficient for error.
+        mean_before_exp: If True (default), average per-body angle error before the
+            exponential. If False, average after -- so each body's orientation
+            error (which directly encodes limb bend/extension) contributes
+            independently. See ``compute_gr_rew``.
 
     Returns:
         MdpComponent configured for rotation tracking.
@@ -798,7 +903,48 @@ def gr_rew_factory(weight: float = 0.3, coefficient: float = -5.0) -> MdpCompone
             "current_rigid_body_rot": EnvContext.current.rigid_body_rot,
             "ref_rigid_body_rot": EnvContext.mimic.ref_state.rigid_body_rot,
         },
-        static_params={"weight": weight, "coefficient": coefficient},
+        static_params={
+            "weight": weight,
+            "coefficient": coefficient,
+            "mean_before_exp": mean_before_exp,
+        },
+    )
+
+
+def dof_pos_rew_factory(
+    weight: float = 0.5,
+    coefficient: float = -5.0,
+    mean_before_exp: bool = False,
+) -> MdpComponent:
+    """Factory for the per-joint DOF-position (joint-angle) tracking reward.
+
+    Directly rewards matching each joint's reference angle, weighting every joint
+    equally instead of diluting it inside a Cartesian per-body mean. Targets the
+    fine articulation (knee flexion, full elbow/shoulder extension) that the global
+    body-position reward under-serves at the extremities.
+
+    Args:
+        weight: Reward weight.
+        coefficient: Exponential coefficient for the squared joint-angle error.
+        mean_before_exp: If False (default), ``mean_joint(exp(coef * err^2))`` --
+            an independent per-joint signal. If True, ``exp(coef * mean_joint(err^2))``.
+
+    Returns:
+        MdpComponent configured for per-joint DOF-position tracking.
+    """
+    from protomotions.envs.rewards import compute_dof_pos_rew
+
+    return MdpComponent(
+        compute_func=compute_dof_pos_rew,
+        dynamic_vars={
+            "current_dof_pos": EnvContext.current.dof_pos,
+            "ref_dof_pos": EnvContext.mimic.ref_state.dof_pos,
+        },
+        static_params={
+            "weight": weight,
+            "coefficient": coefficient,
+            "mean_before_exp": mean_before_exp,
+        },
     )
 
 
@@ -994,6 +1140,8 @@ def mimic_tracking_rewards_factory(
     gv_coef: float = -0.5,
     gav_coef: float = -0.1,
     rh_coef: float = -100.0,
+    gt_mean_before_exp: bool = True,
+    gr_mean_before_exp: bool = True,
 ) -> Dict[str, MdpComponent]:
     """Factory for standard mimic tracking reward bundle.
 
@@ -1010,13 +1158,25 @@ def mimic_tracking_rewards_factory(
         gv_coef: Velocity coefficient.
         gav_coef: Angular velocity coefficient.
         rh_coef: Root height coefficient.
+        gt_mean_before_exp: Aggregation for the position term (see
+            ``gt_rew_factory``). Set False for a stronger per-body signal.
+        gr_mean_before_exp: Aggregation for the rotation term (see
+            ``gr_rew_factory``). Set False for a stronger per-body signal.
 
     Returns:
         Dict of MdpComponent instances for tracking rewards.
     """
     return {
-        "gt_rew": gt_rew_factory(weight=gt_weight, coefficient=gt_coef),
-        "gr_rew": gr_rew_factory(weight=gr_weight, coefficient=gr_coef),
+        "gt_rew": gt_rew_factory(
+            weight=gt_weight,
+            coefficient=gt_coef,
+            mean_before_exp=gt_mean_before_exp,
+        ),
+        "gr_rew": gr_rew_factory(
+            weight=gr_weight,
+            coefficient=gr_coef,
+            mean_before_exp=gr_mean_before_exp,
+        ),
         "gv_rew": gv_rew_factory(weight=gv_weight, coefficient=gv_coef),
         "gav_rew": gav_rew_factory(weight=gav_weight, coefficient=gav_coef),
         "rh_rew": rh_rew_factory(weight=rh_weight, coefficient=rh_coef),
@@ -1175,6 +1335,123 @@ def path_following_reward_factory(
             "weight": weight,
             "pos_err_scale": pos_err_scale,
             "height_err_scale": height_err_scale,
+        },
+    )
+
+
+def body_impact_penalty_rew_factory(
+    vulnerable_body_indices,
+    weight: float = -0.01,
+    threshold: float = 50.0,
+    min_value: Optional[float] = None,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the dangerous-impact penalty (Tier-2 fighting curriculum).
+
+    Penalizes high contact force on vulnerable bodies (everything EXCEPT hands and
+    feet), scaled by the per-env incoming threat ``incoming_damage`` (max damage of
+    active incoming colliders). With only ground/baseline colliders the penalty is
+    ~0, so the policy specifically learns to avoid/brace damaging impacts.
+
+    Args:
+        vulnerable_body_indices: Body indices to penalize (hands/feet excluded).
+            Resolve from the robot config in the experiment file.
+        weight: Reward weight (negative).
+        threshold: Contact-force magnitude below which impacts are ignored.
+        min_value: Optional minimum clamp on the (post-weight) reward.
+        zero_during_grace_period: If True, zero reward during the reset grace period.
+
+    Returns:
+        MdpComponent configured for the dangerous-impact penalty.
+    """
+    import torch
+
+    from protomotions.envs.rewards import compute_body_impact_penalty
+
+    body_indices = torch.as_tensor(list(vulnerable_body_indices), dtype=torch.long)
+    static_params = {
+        "weight": weight,
+        "threshold": threshold,
+        "body_indices": body_indices,
+        "zero_during_grace_period": zero_during_grace_period,
+    }
+    if min_value is not None:
+        static_params["min_value"] = min_value
+
+    return MdpComponent(
+        compute_func=compute_body_impact_penalty,
+        dynamic_vars={
+            "current_contact_force_magnitudes": EnvContext.current_contact_force_magnitudes,
+            "incoming_damage": EnvContext.incoming_damage,
+        },
+        static_params=static_params,
+    )
+
+
+def opponent_impact_rew_factory(
+    weight: float = 0.1,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the opponent-impact reward (multi-character self-play tier).
+
+    Rewards landing fast limb (hand/foot) strikes on opponents. The environment
+    precomputes a per-character striking signal (max closing speed of a striking
+    body toward an in-range opponent key body); this factory just applies a positive
+    weight. Identically zero with a single character, so it is safe in any config.
+
+    Args:
+        weight: Reward weight (positive).
+        zero_during_grace_period: If True, zero reward during the reset grace period.
+
+    Returns:
+        MdpComponent configured for the opponent-impact reward.
+    """
+    from protomotions.envs.rewards import compute_opponent_impact_reward
+
+    return MdpComponent(
+        compute_func=compute_opponent_impact_reward,
+        dynamic_vars={
+            "opponent_impact": EnvContext.opponent_impact,
+        },
+        static_params={
+            "weight": weight,
+            "zero_during_grace_period": zero_during_grace_period,
+        },
+    )
+
+
+def realign_penalty_rew_factory(
+    weight: float = -0.05,
+    deadzone: float = 0.0,
+    zero_during_grace_period: bool = True,
+) -> MdpComponent:
+    """Factory for the re-anchor reliance penalty.
+
+    Penalizes how far smooth re-anchoring shifted the mimic reference this step
+    (``realign_offset_delta``), so the policy treats re-anchoring as a safety net
+    rather than a crutch. When re-anchoring is disabled (e.g. the Tier 1 base) the
+    delta is 0, so this reward is a no-op; it becomes active in tiers that enable
+    re-anchoring. Safe in any config.
+
+    Args:
+        weight: Reward weight (negative to penalize re-anchoring).
+        deadzone: Per-step shift magnitude (m) below which no penalty is applied.
+        zero_during_grace_period: If True, zero reward during the reset grace period.
+
+    Returns:
+        MdpComponent configured for the re-anchor reliance penalty.
+    """
+    from protomotions.envs.rewards import compute_realign_penalty
+
+    return MdpComponent(
+        compute_func=compute_realign_penalty,
+        dynamic_vars={
+            "realign_offset_delta": EnvContext.realign_offset_delta,
+        },
+        static_params={
+            "deadzone": deadzone,
+            "weight": weight,
+            "zero_during_grace_period": zero_during_grace_period,
         },
     )
 
@@ -1829,6 +2106,12 @@ __all__ = [
     "target_reward_factory",
     "steering_reward_factory",
     "path_following_reward_factory",
+    "collision_primitives_obs_factory",
+    "stamina_obs_factory",
+    "dof_pos_rew_factory",
+    "body_impact_penalty_rew_factory",
+    "opponent_impact_rew_factory",
+    "realign_penalty_rew_factory",
     # BeyondMimic reward factories
     "global_anchor_pos_rew_factory",
     "global_anchor_ori_rew_factory",

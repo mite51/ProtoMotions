@@ -30,6 +30,11 @@ class TerrainObs:
     def __init__(self, config: TerrainConfig, env: BaseEnv):
         self.config = config
         self.env = env
+        self.enabled = getattr(config, "terrain_obs_enabled", True)
+
+        if not self.enabled:
+            self.terrain_obs = None
+            return
 
         self.terrain_obs = torch.zeros(
             self.env.num_envs,
@@ -44,15 +49,28 @@ class TerrainObs:
         Args:
             env_ids: Environment indices to update
         """
+        if not self.enabled:
+            return
         root_states = self.env.simulator.get_root_state(env_ids)
+        # The terrain's per-env height-point grid is sized by the physical scene
+        # count (E) and identical across envs. With multi-character self-play the
+        # env_ids are flattened character rows (up to E * N), so map them back to
+        # physical scenes for the grid lookup while keeping the per-character roots.
+        height_point_ids = env_ids
+        num_characters = getattr(self.env, "num_characters", 1)
+        if num_characters > 1:
+            height_point_ids = env_ids // num_characters
         self.terrain_obs[env_ids] = self.env.terrain.get_height_maps(
-            root_states, env_ids
+            root_states, height_point_ids
         )
 
     def get_obs(self):
         """Get terrain observations dictionary.
 
         Returns:
-            Dictionary with 'terrain' key containing height maps
+            Dictionary with 'terrain' key containing height maps, or empty when
+            terrain observations are disabled.
         """
+        if not self.enabled:
+            return {}
         return {"terrain": self.terrain_obs.clone()}

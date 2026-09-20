@@ -179,6 +179,61 @@ def normalized_pd_fixed_gains_action(
     }
 
 
+def normalized_pd_stamina_action(
+    action: Tensor,
+    pd_action_offset: Tensor,
+    pd_action_scale: Tensor,
+    stiffness: Tensor,
+    damping: Tensor,
+    stamina: Tensor,
+    action_transform: ActionTransform = "tanh",
+    clamp_value: float = 1.0,
+) -> Dict[str, Tensor]:
+    """Normalized PD action with per-DOF stamina-scaled gains.
+
+    Identical to :func:`normalized_pd_fixed_gains_action` for the position target,
+    but the returned stiffness/damping are scaled per-DOF by a ``stamina`` factor.
+    Stamina in ``[0, 1]`` weakens the joint drive (fatigue); ``1.0`` reproduces the
+    base gains exactly, which is what Phase-0/Tier-1 training uses.
+
+    The ``stamina`` tensor broadcasts against ``[num_envs, num_actions]``:
+        - ``[num_actions]``            -> same stamina for every env
+        - ``[num_envs, num_actions]``  -> per-env, per-DOF stamina (Phase 4)
+
+    Args:
+        action: Raw action tensor from policy [num_envs, num_actions]
+        pd_action_offset: Per-joint offset (joint default positions) [num_actions]
+        pd_action_scale: Per-joint scale (action range) [num_actions]
+        stiffness: Base per-joint stiffness gains [num_actions]
+        damping: Base per-joint damping gains [num_actions]
+        stamina: Per-DOF stamina scale, broadcastable to [num_envs, num_actions]
+        action_transform: How to bound actions - "tanh", "clamp", or None.
+        clamp_value: Max absolute action value for clamp mode. Default 1.0.
+
+    Returns:
+        Dict with processed_action, stiffness_targets, damping_targets,
+        each shaped [num_envs, num_actions].
+    """
+    if action_transform == "tanh":
+        action = torch.tanh(action)
+    elif action_transform == "clamp":
+        action = torch.clamp(action, -clamp_value, clamp_value)
+
+    batch_size = action.shape[0]
+    processed_action = pd_action_offset + pd_action_scale * action
+
+    # Broadcast base gains to [num_envs, num_actions], then scale by stamina.
+    stiffness_targets = stiffness.unsqueeze(0).expand(batch_size, -1) * stamina
+    damping_targets = damping.unsqueeze(0).expand(batch_size, -1) * stamina
+
+    # Clone outputs for CUDA graphs compatibility
+    return {
+        "processed_action": processed_action.clone(),
+        "stiffness_targets": stiffness_targets.clone(),
+        "damping_targets": damping_targets.clone(),
+    }
+
+
 def passthrough_pd_action(
     action: Tensor,
     stiffness: Tensor,
@@ -314,6 +369,55 @@ def make_pd_action_config(
         "pd_action_scale": pd_action_scale,
         "stiffness": stiffness,
         "damping": damping,
+        "action_transform": action_transform,
+        "clamp_value": clamp_value,
+    }
+
+
+def make_pd_stamina_action_config(
+    robot_config,
+    action_transform: ActionTransform = "tanh",
+    clamp_value: float = 1.0,
+    action_scale: float = 1.0,
+) -> Dict[str, Any]:
+    """Create action config dict for stamina-scaled PD control.
+
+    Same as :func:`make_pd_action_config` but uses
+    :func:`normalized_pd_stamina_action`, whose stiffness/damping are scaled
+    per-DOF by a ``stamina`` factor. The config seeds ``stamina`` with all-ones
+    (``[num_actions]``), so by default it is identical to fixed-gain PD. At
+    runtime the environment overrides ``stamina`` with a per-env, per-DOF tensor
+    (see ``BaseEnv.set_dof_stamina_scale`` / ``_runtime_action_inputs``).
+
+    Requires the robot to use ``ControlType.PROPORTIONAL`` for the gains to take
+    effect (BUILT_IN_PD bakes gains into the engine at setup and ignores
+    per-step gains).
+    """
+    pd_action_offset, pd_action_scale = build_pd_action_offset_scale(
+        robot_config.kinematic_info.hinge_axes_map,
+        robot_config.kinematic_info.dof_limits_lower,
+        robot_config.kinematic_info.dof_limits_upper,
+        action_scale,
+        torch.device("cpu"),
+    )
+
+    joint_names = robot_config.kinematic_info.dof_names
+    stiffness = torch.tensor(
+        [robot_config.control.control_info[j].stiffness for j in joint_names],
+        dtype=torch.float32,
+    )
+    damping = torch.tensor(
+        [robot_config.control.control_info[j].damping for j in joint_names],
+        dtype=torch.float32,
+    )
+
+    return {
+        "fn": normalized_pd_stamina_action,
+        "pd_action_offset": pd_action_offset,
+        "pd_action_scale": pd_action_scale,
+        "stiffness": stiffness,
+        "damping": damping,
+        "stamina": torch.ones_like(stiffness),
         "action_transform": action_transform,
         "clamp_value": clamp_value,
     }

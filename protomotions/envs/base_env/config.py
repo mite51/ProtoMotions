@@ -7,7 +7,7 @@ This module defines the configuration dataclasses for environment settings,
 rewards, terminations, and observation components.
 """
 
-from typing import Optional, Dict, Any, TYPE_CHECKING
+from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING
 from dataclasses import dataclass, field
 
 from protomotions.envs.obs.scene_obs import SceneObsConfig
@@ -93,6 +93,238 @@ class EnvConfig:
         default=False,
         metadata={"help": "Show terrain markers during evaluation. Uses significant memory in IsaacGym."}
     )
+
+    max_collision_primitives: int = field(
+        default=16,
+        metadata={
+            "help": (
+                "Capacity (M) of the per-env collision-primitive candidate buffer that "
+                "feeds the collision_primitives observation. Ground, scene obstacles, "
+                "thrown projectiles, and other characters' key bodies are written into "
+                "this fixed-size buffer; the obs kernel selects the top-K priorities. Must "
+                "be >= the obs K (num_obs_primitives). FROZEN once a tier is trained -- "
+                "changing it changes the ONNX input shape."
+            ),
+            "min": 1,
+        },
+    )
+    collision_selection_range: float = field(
+        default=8.0,
+        metadata={
+            "help": (
+                "Maximum center distance (m) from any character body for a "
+                "collider to be eligible."
+            ),
+            "min": 0.0,
+        },
+    )
+    collision_distance_weight: float = field(
+        default=1.0,
+        metadata={"help": "Priority weight for collider proximity.", "min": 0.0},
+    )
+    collision_closing_speed_weight: float = field(
+        default=1.0,
+        metadata={
+            "help": "Priority weight for velocity toward any character body.",
+            "min": 0.0,
+        },
+    )
+    collision_mass_weight: float = field(
+        default=0.25,
+        metadata={"help": "Priority weight for physical collider mass.", "min": 0.0},
+    )
+    collision_distance_scale: float = field(
+        default=2.0,
+        metadata={"help": "Distance normalization scale (m).", "min": 1.0e-6},
+    )
+    collision_speed_scale: float = field(
+        default=10.0,
+        metadata={"help": "Closing-speed normalization scale (m/s).", "min": 1.0e-6},
+    )
+    collision_mass_scale: float = field(
+        default=10.0,
+        metadata={"help": "Mass normalization scale (kg).", "min": 1.0e-6},
+    )
+    static_collider_effective_mass: float = field(
+        default=100.0,
+        metadata={
+            "help": "Finite effective mass (kg) used to rank static ground/obstacles.",
+            "min": 0.0,
+        },
+    )
+    ground_primitive_damage: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Baseline 'damage' value assigned to the ground collision primitive "
+                "(index 14 of the 17-float layout). Ground is environmental, not a "
+                "threat, so defaults to 0.0."
+            )
+        },
+    )
+    projectile_baseline_damage: float = field(
+        default=0.1,
+        metadata={
+            "help": (
+                "Baseline 'damage' for non-dangerous (passive) thrown projectiles. "
+                "Matches the spec's static-prop baseline."
+            )
+        },
+    )
+    projectile_damage_range: Tuple[float, float] = field(
+        default=(0.3, 1.0),
+        metadata={
+            "help": (
+                "Range from which the 'damage' of the randomly-selected dangerous "
+                "projectiles is sampled each episode."
+            )
+        },
+    )
+    projectile_dangerous_fraction_range: Tuple[float, float] = field(
+        default=(0.0, 1.0),
+        metadata={
+            "help": (
+                "Per-episode, a random fraction (sampled from this range) of the "
+                "projectile pool is designated 'dangerous' and given randomized "
+                "damage; the rest keep the baseline. This realizes 'randomize damage "
+                "on a random number of colliders'."
+            )
+        },
+    )
+    randomize_body_stamina: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, per-episode randomize per-body 'stamina' in "
+                "``body_stamina_range``. Stamina is that body's joint-stiffness "
+                "scale: IsaacLab scales stiffness and torque capacity linearly, damping by sqrt(strength). "
+                "Under BUILT_IN_PD the scaled gains are written into the engine on "
+                "reset (``Simulator.set_joint_gain_scale``); it is also exposed as "
+                "an observation. Off in early tiers (stamina == 1.0 == nominal)."
+            )
+        },
+    )
+    body_stamina_range: Tuple[float, float] = field(
+        default=(0.75, 1.0),
+        metadata={
+            "help": (
+                "Range from which per-body stamina (the joint-stiffness scale) is "
+                "sampled when ``randomize_body_stamina`` is True. 1.0 == nominal "
+                "gains; <1 weaker/more compliant, >1 stiffer."
+            )
+        },
+    )
+    # --- Multi-character self-play (Phase 5) -------------------------------------
+    # The number of characters per scene (N) is set on the *simulator* config
+    # (SimulatorConfig.num_characters); the env reads it from the simulator. These
+    # fields tune the per-character geometry and opponent observation/reward. All
+    # are no-ops when num_characters == 1.
+    character_spawn_radius: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Radius (m) of the circle on which the N characters of a scene are "
+                "spawned (multi-character self-play). Large enough to avoid initial "
+                "interpenetration, small enough that characters can interact."
+            )
+        },
+    )
+    character_interaction_lookahead: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Seconds of sampled root motion used to predict an interaction "
+                "point."
+            ),
+            "min": 0.0,
+        },
+    )
+    character_spawn_radius_variance: float = field(
+        default=0.2,
+        metadata={
+            "help": (
+                "Fractional random variation applied to multi-character spawn "
+                "distance."
+            ),
+            "min": 0.0,
+        },
+    )
+    character_interaction_target_radius: float = field(
+        default=0.2,
+        metadata={
+            "help": (
+                "Per-character target jitter radius around the shared "
+                "interaction point."
+            ),
+            "min": 0.0,
+        },
+    )
+    character_min_spawn_separation: float = field(
+        default=0.4,
+        metadata={
+            "help": "Minimum desired root separation at a multi-character reset.",
+            "min": 0.0,
+        },
+    )
+    opponent_key_body_names: List[str] = field(
+        default_factory=lambda: [
+            "Head",
+            "Pelvis",
+            ".*_Shoulder",
+            ".*_Elbow",
+            ".*_Knee",
+            ".*_Ankle",
+        ],
+        metadata={
+            "help": (
+                "Regex patterns (fullmatch against robot body names) selecting which "
+                "of an opponent's bodies are exposed as collision primitives to other "
+                "characters. Defaults cover head/pelvis/arms/forearms/shins/feet."
+            )
+        },
+    )
+    opponent_body_radius: float = field(
+        default=0.12,
+        metadata={
+            "help": (
+                "Sphere radius (m) used to represent opponent key bodies in the "
+                "collision-primitive observation."
+            )
+        },
+    )
+    striking_body_names: List[str] = field(
+        default_factory=lambda: [".*_Hand", ".*_Ankle", ".*_Toe"],
+        metadata={
+            "help": (
+                "Regex patterns (fullmatch) selecting the character's own bodies that "
+                "earn the opponent-impact reward when they strike an opponent "
+                "(hands/feet). These are the bodies excluded from the impact PENALTY."
+            )
+        },
+    )
+    opponent_strike_radius: float = field(
+        default=0.3,
+        metadata={
+            "help": (
+                "Distance (m) within which a striking body counts as 'impacting' an "
+                "opponent key body for the opponent-impact reward."
+            )
+        },
+    )
+
+    sanitize_non_finite_state: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, tolerate rare non-finite simulator state (PhysX solver "
+                "blowups from hard impacts) by sanitizing it and letting the normal "
+                "termination path reset the affected env, instead of asserting and "
+                "crashing. Intended for impact-heavy training (fighting tiers). "
+                "Default False keeps strict fail-fast validation."
+            )
+        },
+    )
+
     save_dir: str = field(
         default="",
         metadata={"help": "Directory for saving evaluation outputs."}

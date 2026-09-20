@@ -30,3 +30,7 @@ CLAUDE.local.md
 
 # Newton/IsaacLab viewer window state; churns on every run
 imgui.ini
+
+# Local licensed body models and simulator environment (not integration sources).
+/data/smpl/*.pkl
+/env_isaaclab/

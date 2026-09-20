@@ -51,25 +51,44 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 
 
 class _MockState:
-    """Mock for CurrentStateView."""
+    """Mock for CurrentStateView.
+
+    Mirrors the field surface defined in
+    ``protomotions/envs/context_views.py::CurrentStateView`` so that any obs
+    binding (``current.<field>``) resolves during ONNX tracing.
+    """
 
     def __init__(self, num_envs: int, num_dofs: int, num_bodies: int, anchor_idx: int):
         import torch
         import torch.nn.functional as F
 
+        # Per-body state
+        self.rigid_body_pos      = torch.randn(num_envs, num_bodies, 3)
+        self.rigid_body_rot      = F.normalize(torch.randn(num_envs, num_bodies, 4), dim=-1)
+        self.rigid_body_vel      = torch.randn(num_envs, num_bodies, 3)
+        self.rigid_body_ang_vel  = torch.randn(num_envs, num_bodies, 3)
+        self.rigid_body_contacts = torch.zeros(num_envs, num_bodies, dtype=torch.bool)
+
+        # DOF state
+        self.dof_pos    = torch.randn(num_envs, num_dofs)
+        self.dof_vel    = torch.randn(num_envs, num_dofs)
+        self.dof_forces = torch.zeros(num_envs, num_dofs)
         self.anchor_idx = anchor_idx
 
-        # Actor obs fields
-        self.dof_pos = torch.randn(num_envs, num_dofs)
-        self.dof_vel = torch.randn(num_envs, num_dofs)
-        self.anchor_rot = F.normalize(torch.randn(num_envs, 4), dim=-1)
-        self.anchor_pos = torch.randn(num_envs, 3)
-        self.root_local_ang_vel = torch.randn(num_envs, 3)
-        # Critic obs fields
-        self.rigid_body_pos     = torch.randn(num_envs, num_bodies, 3)
-        self.rigid_body_rot     = F.normalize(torch.randn(num_envs, num_bodies, 4), dim=-1)
-        self.rigid_body_vel     = torch.randn(num_envs, num_bodies, 3)
-        self.rigid_body_ang_vel = torch.randn(num_envs, num_bodies, 3)
+        # Root properties
+        self.root_pos            = torch.randn(num_envs, 3)
+        self.root_rot            = F.normalize(torch.randn(num_envs, 4), dim=-1)
+        self.root_vel            = torch.randn(num_envs, 3)
+        self.root_ang_vel        = torch.randn(num_envs, 3)
+        self.root_height         = torch.randn(num_envs)
+        self.root_local_ang_vel  = torch.randn(num_envs, 3)
+
+        # Anchor properties
+        self.anchor_pos            = torch.randn(num_envs, 3)
+        self.anchor_rot            = F.normalize(torch.randn(num_envs, 4), dim=-1)
+        self.anchor_vel            = torch.randn(num_envs, 3)
+        self.anchor_ang_vel        = torch.randn(num_envs, 3)
+        self.anchor_local_ang_vel  = torch.randn(num_envs, 3)
 
 
 class _MockRefState:
@@ -128,12 +147,90 @@ class _MockMimic:
 
 
 class _MockHistorical:
-    """Mock for HistoricalContext (action history)."""
+    """Mock for HistoricalView (state + action history).
 
-    def __init__(self, num_envs: int, history_steps: int, num_dofs: int):
+    Mirrors ``protomotions/envs/context_views.py::HistoricalView``.  All
+    historical observations bind through ``EnvContext.historical.<field>``,
+    so any missing attribute here will raise during obs tracing.
+    """
+
+    def __init__(
+        self,
+        num_envs: int,
+        history_steps: int,
+        num_dofs: int,
+        num_bodies: int,
+    ):
         import torch
+        import torch.nn.functional as F
 
+        # Per-body historical state
+        self.rigid_body_pos     = torch.randn(num_envs, history_steps, num_bodies, 3)
+        self.rigid_body_rot     = F.normalize(
+            torch.randn(num_envs, history_steps, num_bodies, 4), dim=-1
+        )
+        self.rigid_body_vel     = torch.randn(num_envs, history_steps, num_bodies, 3)
+        self.rigid_body_ang_vel = torch.randn(num_envs, history_steps, num_bodies, 3)
+
+        # DOF history
+        self.dof_pos = torch.randn(num_envs, history_steps, num_dofs)
+        self.dof_vel = torch.randn(num_envs, history_steps, num_dofs)
+
+        # Action history.  ``previous_actions_factory(processed=False)`` (the
+        # default) binds to ``historical.actions``; ``processed=True`` binds to
+        # ``historical.processed_actions``.  Provide both.
+        self.actions           = torch.randn(num_envs, history_steps, num_dofs)
         self.processed_actions = torch.randn(num_envs, history_steps, num_dofs)
+
+        # Misc historical scalars
+        self.ground_heights = torch.zeros(num_envs, history_steps)
+        self.body_contacts  = torch.zeros(
+            num_envs, history_steps, num_bodies, dtype=torch.bool
+        )
+
+        # Root properties
+        self.root_pos           = torch.randn(num_envs, history_steps, 3)
+        self.root_rot           = F.normalize(
+            torch.randn(num_envs, history_steps, 4), dim=-1
+        )
+        self.root_ang_vel       = torch.randn(num_envs, history_steps, 3)
+        self.root_local_ang_vel = torch.randn(num_envs, history_steps, 3)
+
+        # Anchor properties
+        self.anchor_pos     = torch.randn(num_envs, history_steps, 3)
+        self.anchor_rot     = F.normalize(
+            torch.randn(num_envs, history_steps, 4), dim=-1
+        )
+        self.anchor_vel     = torch.randn(num_envs, history_steps, 3)
+        self.anchor_ang_vel = torch.randn(num_envs, history_steps, 3)
+
+
+class _MockCollisionPrimitives:
+    """Mock for CollisionPrimitivesView (fighting-mimic obs).
+
+    Mirrors ``protomotions/envs/context_views.py::CollisionPrimitivesView`` so the
+    ``collision_primitives`` obs kernel resolves its bindings during tracing. ``M``
+    is the candidate-buffer capacity (``EnvConfig.max_collision_primitives``); the
+    kernel itself selects the frozen K nearest, so the traced graph's K is fixed by
+    the obs config, independent of M.
+    """
+
+    def __init__(self, num_envs: int, num_primitives: int):
+        import torch
+        import torch.nn.functional as F
+
+        m = num_primitives
+        self.pos      = torch.randn(num_envs, m, 3)
+        self.rot      = F.normalize(torch.randn(num_envs, m, 4), dim=-1)
+        self.lin_vel  = torch.randn(num_envs, m, 3)
+        self.radius   = torch.rand(num_envs, m)
+        self.extent_z = torch.rand(num_envs, m)
+        self.damage   = torch.rand(num_envs, m)
+        # Mass is used only for selection scoring (not emitted in the 17-float
+        # layout); must still be present so dynamic_vars resolve during tracing.
+        self.mass     = torch.ones(num_envs, m)
+        self.shape    = torch.zeros(num_envs, m, 2)
+        self.valid    = torch.ones(num_envs, m)
 
 
 class MockContext:
@@ -147,6 +244,9 @@ class MockContext:
         num_future_steps: int,
         anchor_idx: int,
         history_steps: int = 1,
+        num_primitives: int = 16,
+        num_stamina_bodies: int = 0,
+        num_contact_bodies: int | None = None,
     ):
         import torch
 
@@ -154,7 +254,9 @@ class MockContext:
         self.mimic   = _MockMimic(
             num_envs, num_future_steps, num_dofs, num_bodies, anchor_idx
         )
-        self.historical = _MockHistorical(num_envs, history_steps, num_dofs)
+        self.historical = _MockHistorical(
+            num_envs, history_steps, num_dofs, num_bodies
+        )
         # Raw odometer sensor fields. The heading-local offset to the reference
         # (formerly odom_offset_local_*) is derived on demand inside the graph by
         # compute_odom_offset_local, consumed by odom_offset_factory and
@@ -165,10 +267,22 @@ class MockContext:
         self.odom_disp_start_clean = torch.randn(num_envs, 2)
         self.odom_start_heading_inv = torch.zeros(num_envs, 4)
         self.odom_start_heading_inv[:, 3] = 1.0
-        # body_contacts: used by max_coords_obs observe_contacts
-        self.body_contacts  = torch.zeros(num_envs, num_bodies, dtype=torch.bool)
+        # body_contacts: used by max_coords_obs observe_contacts. Width must match
+        # the env's frozen contact-body subset (len(contact_body_ids)), NOT the full
+        # body count — otherwise the concatenated obs width (and the actor's first
+        # layer) won't match the trained checkpoint.
+        if num_contact_bodies is None:
+            num_contact_bodies = num_bodies
+        self.body_contacts  = torch.zeros(num_envs, num_contact_bodies, dtype=torch.bool)
         # ground_heights: used by max_coords_obs root_height_obs
         self.ground_heights = torch.zeros(num_envs)
+
+        # Fighting-mimic bindings (harmless for non-fight configs that never
+        # request them — the obs module only resolves the keys its actor needs).
+        self.collision_primitives = _MockCollisionPrimitives(num_envs, num_primitives)
+        # One stamina scalar per actuated body; default 1.0 (full strength / inert).
+        if num_stamina_bodies > 0:
+            self.body_stamina = torch.ones(num_envs, num_stamina_bodies)
 
 
 # ---------------------------------------------------------------------------
@@ -271,32 +385,49 @@ def export_tracker(
             if "history_steps" in sp:
                 history_steps = sp["history_steps"]
 
-    # Resolve MuJoCo-specific timing.
+    # Resolve timing from the *training* simulator config.
+    #
+    # ``control_dt`` (and the substep cadence it implies) is hard-baked
+    # into the policy via the ``historical_actions`` rotation rate and
+    # the ``mimic_future_*`` look-ahead (which is queried at
+    # ``t + i * control_dt`` for ``i in future_step_indices``). The
+    # deploy host *must* tick at the exact cadence the policy was
+    # trained at; baking the wrong cadence into the YAML silently
+    # corrupts the closed loop in a way that looks like a balance-policy
+    # failure (under-impulse per tick, off-by-N-ms future targets) and
+    # is very hard to diagnose downstream.
+    #
+    # Previously this block ran the simulator config through
+    # ``update_simulator_config_for_test(..., new_simulator="mujoco")``
+    # and used MuJoCo's defaults (typically 1 kHz physics, 20
+    # decimation -> 50 Hz control), which is appropriate for an MJCF
+    # deployment target but DOES NOT REFLECT the cadence the policy was
+    # actually trained at. If the trainer ran IsaacLab at 30 Hz the
+    # YAML would still say 50 Hz and any deploy host that trusted it
+    # would diverge. We now read the trainer's own sim.fps / decimation
+    # directly, and warn loudly if they aren't available.
     control_dt = 0.02
     physics_dt = 0.001
     decimation = 20
     pd_target_max_accel = None
     if simulator_config is not None:
-        try:
-            from protomotions.simulator.factory import update_simulator_config_for_test
-            mj_sim_cfg = update_simulator_config_for_test(
-                current_simulator_config=simulator_config,
-                new_simulator="mujoco",
-                robot_config=robot_config,
-            )
-            physics_dt = 1.0 / mj_sim_cfg.sim.fps
-            decimation = mj_sim_cfg.sim.decimation
+        sim_cfg = getattr(simulator_config, "sim", None)
+        _fps = getattr(sim_cfg, "fps", None) if sim_cfg is not None else None
+        _dec = getattr(sim_cfg, "decimation", None) if sim_cfg is not None else None
+        if _fps and _dec:
+            physics_dt = 1.0 / float(_fps)
+            decimation = int(_dec)
             control_dt = physics_dt * decimation
-        except Exception as e:
-            log.warning(f"Could not apply sim2sim conversion: {e}")
-            sim_cfg = getattr(simulator_config, "sim", None)
-            if sim_cfg is not None:
-                _fps = getattr(sim_cfg, "fps", None)
-                _dec = getattr(sim_cfg, "decimation", None)
-                if _fps and _dec:
-                    physics_dt = 1.0 / _fps
-                    decimation = _dec
-                    control_dt = physics_dt * decimation
+        else:
+            log.warning(
+                "simulator_config.sim.fps / .decimation not available; "
+                "falling back to deployment defaults "
+                "(control_dt=%.4fs, physics_dt=%.4fs, decimation=%d). "
+                "The deployed host MUST tick at the policy's training "
+                "cadence — verify these values match training and "
+                "override on the deploy side if not.",
+                control_dt, physics_dt, decimation,
+            )
         _accel = getattr(simulator_config, "pd_target_max_accel", None)
         if _accel is not None:
             pd_target_max_accel = float(_accel)
@@ -314,6 +445,32 @@ def export_tracker(
     # ------------------------------------------------------------------
     # 4. Build MockContext for ONNX tracing shape inference
     # ------------------------------------------------------------------
+    # Fighting-mimic dimensions (default to inert values for stock trackers):
+    #   M  = collision-primitive candidate-buffer capacity
+    #   num_stamina_bodies = one stamina scalar per actuated body
+    num_primitives = int(getattr(env_config, "max_collision_primitives", 16))
+    hinge_axes_map = getattr(robot_config.kinematic_info, "hinge_axes_map", None)
+    num_stamina_bodies = len(hinge_axes_map) if hinge_axes_map is not None else 0
+
+    # Contact-body subset width: max_coords_obs(observe_contacts=True) emits one
+    # channel per body in robot_config.contact_bodies (resolved against body_names),
+    # which is typically a small frozen subset (feet/hands/head/torso), not all bodies.
+    num_contact_bodies = num_bodies
+    contact_bodies = getattr(robot_config, "contact_bodies", None)
+    if contact_bodies is not None:
+        from protomotions.components.pose_lib import build_body_ids_tensor
+
+        num_contact_bodies = len(
+            build_body_ids_tensor(body_names, contact_bodies, "cpu")
+        )
+
+    if "collision_primitives" in actor_obs_keys or "stamina_obs" in actor_obs_keys:
+        log.info(
+            f"Fighting-mimic obs detected: M={num_primitives} primitives, "
+            f"{num_stamina_bodies} stamina bodies, "
+            f"{num_contact_bodies} contact bodies"
+        )
+
     mock = MockContext(
         num_envs=1,
         num_dofs=num_dofs,
@@ -321,6 +478,9 @@ def export_tracker(
         num_future_steps=num_future_steps,
         anchor_idx=anchor_body_index,
         history_steps=history_steps,
+        num_primitives=num_primitives,
+        num_stamina_bodies=num_stamina_bodies,
+        num_contact_bodies=num_contact_bodies,
     )
 
     # ------------------------------------------------------------------
@@ -602,6 +762,8 @@ def export_tracker(
         future_step_indices=future_step_indices,
         checkpoint=str(checkpoint_path),
         control_type=control_type,
+        contact_body_names=[body_names[i] for i in build_body_ids_tensor(body_names, contact_bodies, "cpu").tolist()] if contact_bodies else [],
+        stamina_body_names=[body_names[i] for i in sorted(hinge_axes_map)] if hinge_axes_map else [],
     )
 
     yaml_path = output_path / "unified_pipeline.yaml"
@@ -647,6 +809,8 @@ def _build_yaml(
     future_step_indices,
     checkpoint,
     control_type,
+    contact_body_names=None,
+    stamina_body_names=None,
 ) -> dict:
     """Build the rich YAML metadata dict."""
 
@@ -662,7 +826,40 @@ def _build_yaml(
         }
 
         # Determine kind and element names
-        if "dof_pos" in key and "future" not in key:
+        if key.startswith("collision_primitives."):
+            field = key.split(".", 1)[1]
+            descriptors = {
+                "pos": ("m", ["x", "y", "z"], "World position of candidate centre"),
+                "rot": ("quaternion", ["x", "y", "z", "w"], "World orientation, xyzw"),
+                "lin_vel": ("m/s", ["x", "y", "z"], "World linear velocity"),
+                "radius": ("m", None, "Sphere/capsule radius; zero for boxes"),
+                "extent_z": ("m", None, "Cube side length or capsule cylinder length; zero for spheres"),
+                "damage": ("unitless", None, "Threat metadata; does not itself apply body damage"),
+                "mass": ("kg", None, "Mass used in top-K selection; static ground uses an effective mass"),
+                "shape": ("one_hot", ["is_box", "is_sphere"], "Capsule is [0,0]"),
+                "valid": ("binary", None, "One for active candidates; zero for padding"),
+            }
+            if field in descriptors:
+                units, channels, description = descriptors[field]
+                entry.update(kind="collision_primitive_" + field, units=units,
+                             frame="world", source=description)
+                if channels is not None:
+                    entry["element_names"] = [channels]
+        elif key == "body_contacts":
+            entry.update(kind="body_contacts", element_names=[contact_body_names],
+                         source="Binary sensed contacts in listed subset order")
+        elif key == "body_stamina":
+            entry.update(kind="body_strength", element_names=[stamina_body_names],
+                         source="Effective strength per actuated body, [0,1]; one is nominal")
+        elif key == "ground_heights":
+            entry.update(kind="ground_height", units="m", frame="world",
+                         source="Ground height below the robot anchor")
+        elif key.startswith("current.rigid_body_"):
+            field = key.split("current.rigid_body_", 1)[1]
+            channels = ["x", "y", "z", "w"] if field == "rot" else ["x", "y", "z"]
+            entry.update(kind="body_" + field, frame="world",
+                         element_names=[body_names, channels])
+        elif "dof_pos" in key and "future" not in key:
             entry["kind"] = "joint_pos"
             entry["element_names"] = [joint_names]
         elif "dof_vel" in key and "future" not in key:
@@ -879,6 +1076,15 @@ def _build_yaml(
             "future_dt_seconds": [round(s * control_dt, 6) for s in future_step_indices],
         },
     }
+    if stamina_body_names:
+        content["control"]["body_strength"] = {
+            "body_names": stamina_body_names,
+            "stiffness_scale": "s",
+            "damping_scale": "sqrt(s)",
+            "effort_limit_scale": "s",
+            "applied_by": "physics host, outside the ONNX graph",
+            "note": "Graph gain outputs are nominal; apply observed strength to cached nominal engine properties.",
+        }
     return content
 
 

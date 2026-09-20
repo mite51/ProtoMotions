@@ -59,6 +59,10 @@ from protomotions.simulator.base_simulator.simulator_state import (
 class IsaacLabSimulator(Simulator):
     config: IsaacLabSimulatorConfig
 
+    # IsaacLab builds per-slot Cuboid/Sphere/Capsule projectile geometry (see
+    # ``protomotions.simulator.isaaclab.utils.scene``), so mixed shapes are realized.
+    _supports_mixed_projectile_shapes: bool = True
+
     # =====================================================
     # Group 1: Initialization & Configuration
     # =====================================================
@@ -136,14 +140,33 @@ class IsaacLabSimulator(Simulator):
         Called by base class _initialize_with_markers() after visualization markers
         are set. Completes scene setup and resets simulation.
         """
-        self._robot = self._scene["robot"]
-        # Build a mapping from body name to contact sensor (if it exists)
-        self._contact_sensor_map = {}
-        for body_name in self._body_names:
-            if f"contact_sensor_{body_name}" in self._scene.keys():
-                self._contact_sensor_map[body_name] = self._scene[
-                    f"contact_sensor_{body_name}"
-                ]
+        # Robot articulation(s). For multi-character self-play we fetch all N
+        # articulations spawned by SceneCfg (robot_0..robot_{N-1}); for N == 1 the
+        # single legacy "robot" key is used. ``self._robot`` aliases character 0 so
+        # all existing single-robot code paths (domain randomization, push, camera,
+        # markers) keep working unchanged.
+        def _attr_name(idx: int) -> str:
+            return "robot" if self.num_characters == 1 else f"robot_{idx}"
+
+        self._robots = [
+            self._scene[_attr_name(c)] for c in range(self.num_characters)
+        ]
+        self._robot = self._robots[0]
+
+        # Per-character body-name -> contact sensor maps.
+        self._contact_sensor_maps = []
+        for c in range(self.num_characters):
+            sensor_map = {}
+            for body_name in self._body_names:
+                if self.num_characters == 1:
+                    key = f"contact_sensor_{body_name}"
+                else:
+                    key = f"contact_sensor_{_attr_name(c)}_{body_name}"
+                if key in self._scene.keys():
+                    sensor_map[body_name] = self._scene[key]
+            self._contact_sensor_maps.append(sensor_map)
+        # Backward-compatible alias used by single-character code paths.
+        self._contact_sensor_map = self._contact_sensor_maps[0]
 
         self._object = []
         self._object_contact_sensor = []
@@ -483,7 +506,7 @@ class IsaacLabSimulator(Simulator):
 
                 if num_buckets == 0:
                     continue
-                bucket_ids = torch.randint(0, num_buckets, (self.num_envs,))
+                bucket_ids = torch.randint(0, num_buckets, (self.num_physical_envs,))
                 static_values = (
                     static_friction[bucket_ids, idx].unsqueeze(-1)
                     if static_friction is not None
@@ -620,12 +643,70 @@ class IsaacLabSimulator(Simulator):
             self._scene.update(dt=self._sim.get_physics_dt())
 
     def _apply_simulator_pd_targets(self, pd_targets: torch.Tensor) -> None:
-        """Applies PD position targets using IsaacLab's internal PD controller."""
-        self._robot.set_joint_position_target(pd_targets.detach(), joint_ids=None)
+        """Applies PD position targets using IsaacLab's internal PD controller.
+
+        ``pd_targets`` is in the flattened RL row layout ([E * N, num_dof]); it is
+        split back into per-character slices and applied to each articulation.
+        """
+        if self.num_characters == 1:
+            self._robot.set_joint_position_target(pd_targets.detach(), joint_ids=None)
+            return
+        targets = pd_targets.view(self.num_physical_envs, self.num_characters, -1)
+        for c in range(self.num_characters):
+            self._robots[c].set_joint_position_target(targets[:, c].detach(), joint_ids=None)
 
     def _apply_simulator_torques(self, torques: torch.Tensor) -> None:
-        """Applies torques to the robot DOFs."""
-        self._robot.set_joint_effort_target(torques.detach(), joint_ids=None)
+        """Applies torques to the robot DOFs (flattened RL row layout)."""
+        if self.num_characters == 1:
+            self._robot.set_joint_effort_target(torques.detach(), joint_ids=None)
+            return
+        t = torques.view(self.num_physical_envs, self.num_characters, -1)
+        for c in range(self.num_characters):
+            self._robots[c].set_joint_effort_target(t[:, c].detach(), joint_ids=None)
+
+    def set_joint_gain_scale(
+        self, scale: torch.Tensor, env_ids: Optional[torch.Tensor] = None
+    ) -> None:
+        """Scale strength in common DOF order from cached nominal engine properties.
+
+        Kp and torque limits scale linearly; Kd scales with sqrt(strength), keeping
+        the nominal damping ratio approximately constant. Lower Kp reduces response
+        speed, and lower torque limits prevent compensating with arbitrarily large
+        target errors. This does not impose a hard joint-speed limit.
+        """
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        if env_ids.numel() == 0:
+            return
+        if not hasattr(self, "_nominal_strength_properties"):
+            self._nominal_strength_properties = [
+                {key: wp.to_torch(getattr(robot.data, key)).clone()
+                 for key in ("joint_stiffness", "joint_damping", "joint_effort_limits")}
+                for robot in self._robots
+            ]
+        sim_scale = scale[:, self.data_conversion.dof_convert_to_sim]
+        for c, robot in enumerate(self._robots):
+            mask = env_ids % self.num_characters == c
+            if not mask.any():
+                continue
+            ids = env_ids[mask] // self.num_characters
+            strength = sim_scale[mask]
+            nominal = self._nominal_strength_properties[c]
+            kp = nominal["joint_stiffness"][ids] * strength
+            kd = nominal["joint_damping"][ids] * strength.sqrt()
+            effort = nominal["joint_effort_limits"][ids] * strength
+            robot.write_joint_stiffness_to_sim_index(stiffness=kp, env_ids=ids)
+            robot.write_joint_damping_to_sim_index(damping=kd, env_ids=ids)
+            robot.write_joint_effort_limit_to_sim_index(limits=effort, env_ids=ids)
+            # Keep implicit-actuator torque estimates consistent with PhysX.
+            for actuator in robot.actuators.values():
+                joints = actuator.joint_indices
+                for key, value in (("stiffness", kp), ("damping", kd),
+                                   ("effort_limit", effort), ("effort_limit_sim", effort)):
+                    cache = getattr(actuator, key)
+                    if not isinstance(cache, torch.Tensor):
+                        cache = wp.to_torch(cache)
+                    cache[ids] = value[:, joints]
 
     def _set_simulator_env_state(
         self,
@@ -650,14 +731,45 @@ class IsaacLabSimulator(Simulator):
             ],
             dim=-1,
         )
-        self._robot.write_root_state_to_sim(init_root_state, env_ids)
-        self._robot.set_joint_position_target(
-            new_states.dof_pos, joint_ids=None, env_ids=env_ids
-        )
-        self._robot.write_joint_state_to_sim(
-            new_states.dof_pos, new_states.dof_vel, None, env_ids
-        )
-        if new_object_states is not None and len(self._object) > 0:
+        if self.num_characters == 1:
+            self._robot.write_root_state_to_sim(init_root_state, env_ids)
+            self._robot.set_joint_position_target(
+                new_states.dof_pos, joint_ids=None, env_ids=env_ids
+            )
+            self._robot.write_joint_state_to_sim(
+                new_states.dof_pos, new_states.dof_vel, None, env_ids
+            )
+        else:
+            # env_ids are flattened character rows; route each character's reset
+            # state to its articulation, writing only the physical scenes involved.
+            if env_ids is None:
+                env_ids = torch.arange(self.num_envs, device=self.device)
+            N = self.num_characters
+            char_of_row = env_ids % N
+            phys_of_row = env_ids // N
+            for c in range(N):
+                mask = char_of_row == c
+                if not mask.any():
+                    continue
+                eids = phys_of_row[mask]
+                self._robots[c].write_root_state_to_sim(init_root_state[mask], eids)
+                self._robots[c].set_joint_position_target(
+                    new_states.dof_pos[mask], joint_ids=None, env_ids=eids
+                )
+                self._robots[c].write_joint_state_to_sim(
+                    new_states.dof_pos[mask],
+                    new_states.dof_vel[mask],
+                    None,
+                    eids,
+                )
+        if (
+            new_object_states is not None
+            and self.scene_lib.num_objects_per_scene > 0
+        ):
+            assert self.num_characters == 1, (
+                "Scene objects are not supported with multi-character self-play "
+                "(num_characters > 1)."
+            )
             init_object_root_state = torch.cat(
                 [
                     new_object_states.root_pos,
@@ -700,6 +812,34 @@ class IsaacLabSimulator(Simulator):
             dof_names=semantic_joint_names,
         )
 
+    def _stack_robots(self, per_robot: List[torch.Tensor]) -> torch.Tensor:
+        """Flatten a list of N per-character tensors into the RL row layout.
+
+        Each input tensor has leading dim ``num_physical_envs`` (E). The output has
+        leading dim ``num_envs`` (E * N), ordered so RL row ``r`` maps to physical
+        scene ``r // N`` and character ``r % N`` (consecutive rows are the N
+        characters of one scene). For N == 1 this returns the single tensor reshaped
+        to the identical shape, so single-character behavior is unchanged.
+        """
+        per_robot = [x if isinstance(x, torch.Tensor) else wp.to_torch(x) for x in per_robot]
+        stacked = torch.stack(per_robot, dim=1)  # [E, N, *rest]
+        return stacked.reshape(self.num_envs, *stacked.shape[2:])
+
+    def get_robot_body_masses(self) -> torch.Tensor:
+        """Return PhysX body masses in flattened row and common body order."""
+        try:
+            per_robot = [
+                robot.root_view.get_masses() for robot in self._robots
+            ]
+        except (AttributeError, RuntimeError):
+            return super().get_robot_body_masses()
+        # PhysX returns mass properties on CPU even when simulation state lives on
+        # CUDA. Move both the values and ordering indices to the simulator device
+        # before indexing; the environment consumes this tensor alongside GPU state.
+        masses = self._stack_robots(per_robot).to(self.device)
+        body_order = self.data_conversion.body_convert_to_common.to(masses.device)
+        return masses[:, body_order]
+
     def _get_simulator_bodies_state(
         self, env_ids: Optional[torch.Tensor] = None
     ) -> RobotState:
@@ -712,24 +852,18 @@ class IsaacLabSimulator(Simulator):
         Returns:
             RobotState: The state of the bodies.
         """
-        isaacsim_bodies_positions = wp.to_torch(self._robot.data.body_pos_w).clone()
-        isaacsim_bodies_rotations = wp.to_torch(self._robot.data.body_quat_w).clone()
-        isaacsim_bodies_velocities = wp.to_torch(self._robot.data.body_lin_vel_w).clone()
-        isaacsim_bodies_ang_velocities = wp.to_torch(
-            self._robot.data.body_ang_vel_w
-        ).clone()
-
-        isaacsim_bodies_positions = isaacsim_bodies_positions.view(
-            self.num_envs, self._num_bodies, 3
+        E = self.num_physical_envs
+        isaacsim_bodies_positions = self._stack_robots(
+            [wp.to_torch(r.data.body_pos_w).view(E, self._num_bodies, 3) for r in self._robots]
         )
-        isaacsim_bodies_rotations = isaacsim_bodies_rotations.view(
-            self.num_envs, self._num_bodies, 4
+        isaacsim_bodies_rotations = self._stack_robots(
+            [wp.to_torch(r.data.body_quat_w).view(E, self._num_bodies, 4) for r in self._robots]
         )
-        isaacsim_bodies_velocities = isaacsim_bodies_velocities.view(
-            self.num_envs, self._num_bodies, 3
+        isaacsim_bodies_velocities = self._stack_robots(
+            [wp.to_torch(r.data.body_lin_vel_w).view(E, self._num_bodies, 3) for r in self._robots]
         )
-        isaacsim_bodies_ang_velocities = isaacsim_bodies_ang_velocities.view(
-            self.num_envs, self._num_bodies, 3
+        isaacsim_bodies_ang_velocities = self._stack_robots(
+            [wp.to_torch(r.data.body_ang_vel_w).view(E, self._num_bodies, 3) for r in self._robots]
         )
         if env_ids is not None:
             isaacsim_bodies_positions = isaacsim_bodies_positions[env_ids]
@@ -756,7 +890,9 @@ class IsaacLabSimulator(Simulator):
         Returns:
             torch.Tensor: The DOF forces.
         """
-        isaacsim_dof_forces = wp.to_torch(self._robot.data.applied_torque).clone()
+        isaacsim_dof_forces = self._stack_robots(
+            [r.data.applied_torque for r in self._robots]
+        )
         if env_ids is not None:
             isaacsim_dof_forces = isaacsim_dof_forces[env_ids]
         return RobotState(
@@ -775,8 +911,12 @@ class IsaacLabSimulator(Simulator):
         Returns:
             RobotState: The DOF state.
         """
-        isaacsim_dof_pos = wp.to_torch(self._robot.data.joint_pos).clone()
-        isaacsim_dof_vel = wp.to_torch(self._robot.data.joint_vel).clone()
+        isaacsim_dof_pos = self._stack_robots(
+            [r.data.joint_pos for r in self._robots]
+        )
+        isaacsim_dof_vel = self._stack_robots(
+            [r.data.joint_vel for r in self._robots]
+        )
         if env_ids is not None:
             isaacsim_dof_pos = isaacsim_dof_pos[env_ids]
             isaacsim_dof_vel = isaacsim_dof_vel[env_ids]
@@ -816,20 +956,23 @@ class IsaacLabSimulator(Simulator):
         # Get simulator body ordering
         sim_body_names = self._robot.body_names
         num_bodies = len(sim_body_names)
+        E = self.num_physical_envs
 
-        # Pre-allocate tensor for contact forces (initialized to zeros)
-        rigid_body_contact_forces = torch.zeros(
-            self.num_envs, num_bodies, 3, device=self.device
-        )
-
-        # Fill in contact forces for bodies that have sensors
-        for body_idx, body_name in enumerate(sim_body_names):
-            if body_name in self._contact_sensor_map:
-                contact_sensor = self._contact_sensor_map[body_name]
-                # net_forces_w has shape [num_envs, 1, 3], extract the single body dimension
-                rigid_body_contact_forces[:, body_idx, :] = (
-                    wp.to_torch(contact_sensor.data.net_forces_w).clone()[:, 0, :]
-                )
+        # Build per-character [E, num_bodies, 3] contact-force tensors, then flatten.
+        per_robot_forces = []
+        for c in range(self.num_characters):
+            forces = torch.zeros(E, num_bodies, 3, device=self.device)
+            sensor_map = self._contact_sensor_maps[c]
+            for body_idx, body_name in enumerate(sim_body_names):
+                if body_name in sensor_map:
+                    contact_sensor = sensor_map[body_name]
+                    # net_forces_w has shape [E, 1, 3]; includes inter-character
+                    # contacts regardless of the sensor filter list.
+                    forces[:, body_idx, :] = wp.to_torch(contact_sensor.data.net_forces_w).clone()[
+                        :, 0, :
+                    ]
+            per_robot_forces.append(forces)
+        rigid_body_contact_forces = self._stack_robots(per_robot_forces)
 
         if env_ids is not None:
             rigid_body_contact_forces = rigid_body_contact_forces[env_ids]
@@ -894,10 +1037,18 @@ class IsaacLabSimulator(Simulator):
         Returns:
             RootOnlyState: The robot's root state.
         """
-        isaacsim_root_pos = wp.to_torch(self._robot.data.root_pos_w).clone()
-        isaacsim_root_rot = wp.to_torch(self._robot.data.root_quat_w).clone()
-        isaacsim_root_vel = wp.to_torch(self._robot.data.root_lin_vel_w).clone()
-        isaacsim_root_ang_vel = wp.to_torch(self._robot.data.root_ang_vel_w).clone()
+        isaacsim_root_pos = self._stack_robots(
+            [r.data.root_pos_w for r in self._robots]
+        )
+        isaacsim_root_rot = self._stack_robots(
+            [r.data.root_quat_w for r in self._robots]
+        )
+        isaacsim_root_vel = self._stack_robots(
+            [r.data.root_lin_vel_w for r in self._robots]
+        )
+        isaacsim_root_ang_vel = self._stack_robots(
+            [r.data.root_ang_vel_w for r in self._robots]
+        )
         if env_ids is not None:
             isaacsim_root_pos = isaacsim_root_pos[env_ids]
             isaacsim_root_rot = isaacsim_root_rot[env_ids]
@@ -964,8 +1115,8 @@ class IsaacLabSimulator(Simulator):
         Returns:
             int: Number of actors per environment.
         """
-        root_pos = wp.to_torch(self._robot.data.root_pos_w)
-        return root_pos.shape[0] // self.num_envs
+        # Each character is a separate single-actor articulation in IsaacLab.
+        return 1
 
     # =====================================================
     # Group 5: Control & Computation Methods

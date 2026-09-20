@@ -551,6 +551,67 @@ class SceneSurfaceContext:
         self.object_valid_mask = object_valid_mask
 
 
+class CollisionPrimitivesView:
+    """Fixed-capacity buffer of candidate collision primitives in WORLD frame.
+
+    The environment writes ground, obstacles, projectiles, and (in the
+    multi-character tier) other characters' key bodies into these M-wide tensors
+    each step. The ``collision_primitives`` observation kernel transforms them to
+    the egocentric frame, range-gates and priority-ranks them uniformly, and emits
+    the 17-float layout for the selected K.
+
+    Padding slots carry ``valid == 0.0`` and are ignored (sorted to the end and
+    zeroed) by the kernel.
+
+    All fields are FieldPath descriptors for dual class/instance access.
+    """
+
+    pos: Tensor = FieldPath()
+    rot: Tensor = FieldPath()
+    lin_vel: Tensor = FieldPath()
+    radius: Tensor = FieldPath()
+    extent_z: Tensor = FieldPath()
+    damage: Tensor = FieldPath()
+    mass: Tensor = FieldPath()
+    shape: Tensor = FieldPath()
+    valid: Tensor = FieldPath()
+
+    def __init__(
+        self,
+        pos: Tensor,
+        rot: Tensor,
+        lin_vel: Tensor,
+        radius: Tensor,
+        extent_z: Tensor,
+        damage: Tensor,
+        mass: Tensor,
+        shape: Tensor,
+        valid: Tensor,
+    ):
+        """Initialize CollisionPrimitivesView.
+
+        Args:
+            pos: World positions [num_envs, M, 3].
+            rot: World rotations [num_envs, M, 4] (quaternion, xyzw).
+            lin_vel: World linear velocities [num_envs, M, 3].
+            radius: Sphere/capsule radius [num_envs, M] (0 for boxes).
+            extent_z: Box height / capsule length [num_envs, M] (0 for spheres).
+            damage: Threat scalar [num_envs, M].
+            mass: Physical/effective mass [num_envs, M], used only for selection.
+            shape: Shape one-hot [num_envs, M, 2] == [is_box, is_sphere].
+            valid: Validity flag [num_envs, M] (1.0 active, 0.0 padding).
+        """
+        self.pos = pos
+        self.rot = rot
+        self.lin_vel = lin_vel
+        self.radius = radius
+        self.extent_z = extent_z
+        self.damage = damage
+        self.mass = mass
+        self.shape = shape
+        self.valid = valid
+
+
 # =============================================================================
 # Main Context Class
 # =============================================================================
@@ -604,6 +665,10 @@ class EnvContext:
     body_contacts: Optional[Tensor] = FieldPath()
     current_contact_force_magnitudes: Optional[Tensor] = FieldPath()
     prev_contact_force_magnitudes: Optional[Tensor] = FieldPath()
+    incoming_damage: Optional[Tensor] = FieldPath()
+    body_stamina: Optional[Tensor] = FieldPath()
+    opponent_impact: Optional[Tensor] = FieldPath()
+    realign_offset_delta: Optional[Tensor] = FieldPath()
     dt: float = FieldPath()
     progress_buf: Optional[Tensor] = FieldPath()
 
@@ -630,6 +695,11 @@ class EnvContext:
     odom_start_heading_inv: Optional[Tensor] = FieldPath()
     odom_disp_start_corrupt: Optional[Tensor] = FieldPath()
     odom_disp_start_clean: Optional[Tensor] = FieldPath()
+
+    # Collision primitives (ground/obstacles/projectiles/other characters)
+    collision_primitives: Optional[CollisionPrimitivesView] = NestedField(
+        CollisionPrimitivesView
+    )
 
     # Control-specific contexts (populated by controllers via populate_context)
     mimic: Optional[MimicContext] = NestedField(MimicContext)
@@ -665,6 +735,11 @@ class EnvContext:
         odom_start_heading_inv: Optional[Tensor] = None,
         odom_disp_start_corrupt: Optional[Tensor] = None,
         odom_disp_start_clean: Optional[Tensor] = None,
+        incoming_damage: Optional[Tensor] = None,
+        body_stamina: Optional[Tensor] = None,
+        opponent_impact: Optional[Tensor] = None,
+        realign_offset_delta: Optional[Tensor] = None,
+        collision_primitives: Optional[CollisionPrimitivesView] = None,
         mimic: Optional[MimicContext] = None,
         masked_mimic: Optional[MaskedMimicContext] = None,
         steering: Optional[SteeringContext] = None,
@@ -725,6 +800,10 @@ class EnvContext:
         self.current_contact_force_magnitudes = current_contact_force_magnitudes
         self.prev_contact_force_magnitudes = prev_contact_force_magnitudes
         self.progress_buf = progress_buf
+        self.incoming_damage = incoming_damage
+        self.body_stamina = body_stamina
+        self.opponent_impact = opponent_impact
+        self.realign_offset_delta = realign_offset_delta
 
         # Contact tracking
         self.contact_body_ids = contact_body_ids
@@ -738,6 +817,9 @@ class EnvContext:
         self.odom_start_heading_inv = odom_start_heading_inv
         self.odom_disp_start_corrupt = odom_disp_start_corrupt
         self.odom_disp_start_clean = odom_disp_start_clean
+
+        # Collision primitives
+        self.collision_primitives = collision_primitives
 
         # Control-specific views
         self.mimic = mimic

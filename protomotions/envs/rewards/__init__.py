@@ -42,6 +42,8 @@ from protomotions.envs.rewards.tracking import (
     # Heading-local relative tracking (realign=OFF compatible)
     compute_gt_rel_rew,
     compute_anchor_xy_rew,
+
+    compute_dof_pos_rew,
     # BeyondMimic-style kernels
     compute_global_position_error_exp,
     compute_global_anchor_pos_rew,
@@ -68,6 +70,9 @@ from protomotions.envs.rewards.regularization import (
     compute_soft_pos_limit_rew,
     compute_contact_match_rew,
     compute_contact_force_change_rew,
+    compute_body_impact_penalty,
+    compute_opponent_impact_reward,
+    compute_realign_penalty,
     # Helper functions
     joint_limit_violation,
     contact_mismatch_sum,
@@ -98,6 +103,8 @@ __all__ = [
     # Heading-local relative tracking (realign=OFF compatible)
     "compute_gt_rel_rew",
     "compute_anchor_xy_rew",
+
+    "compute_dof_pos_rew",
     # BeyondMimic-style kernels
     "compute_global_position_error_exp",
     "compute_global_anchor_pos_rew",
@@ -118,6 +125,9 @@ __all__ = [
     "compute_soft_pos_limit_rew",
     "compute_contact_match_rew",
     "compute_contact_force_change_rew",
+    "compute_body_impact_penalty",
+    "compute_opponent_impact_reward",
+    "compute_realign_penalty",
     # Regularization helper functions
     "joint_limit_violation",
     "contact_mismatch_sum",

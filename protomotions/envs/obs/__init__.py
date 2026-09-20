@@ -73,6 +73,15 @@ from protomotions.envs.obs.target import compute_target_obs
 
 # Nearest surface observation compute kernel
 
+# Collision-primitive observation compute kernel
+from protomotions.envs.obs.collision_primitives import (
+    compute_collision_primitives_obs,
+    PRIMITIVE_FEATURE_DIM,
+)
+
+# Per-body stamina observation compute kernel
+from protomotions.envs.obs.stamina import compute_stamina_obs
+
 # Observation noise utilities
 from protomotions.envs.obs.observation_noise import (
     NoisyObservations,
@@ -128,6 +137,12 @@ __all__ = [
     "compute_target_obs",
     # Nearest surface observation compute kernel
     "compute_nearest_surface_vectors",
+
+    # Collision-primitive observation compute kernel
+    "compute_collision_primitives_obs",
+    "PRIMITIVE_FEATURE_DIM",
+    # Per-body stamina observation compute kernel
+    "compute_stamina_obs",
     # Observation noise utilities
     "NoisyObservations",
     "apply_observation_noise",
