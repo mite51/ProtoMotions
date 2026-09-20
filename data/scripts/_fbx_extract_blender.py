@@ -73,7 +73,18 @@ _FCURVE_PATH_RE = re.compile(r'^pose\.bones\["([^"]+)"\]\.(location|rotation_qua
 def _build_action_fcurve_index(action):
     """Return ``{(bone_name, prop): {array_index: fcurve}}`` for fast frame eval."""
     index = {}
-    for fc in action.fcurves:
+    if hasattr(action, "fcurves"):
+        fcurves = action.fcurves
+    else:
+        # Blender 5 stores imported animation curves in layered channel bags.
+        fcurves = [
+            fc
+            for layer in action.layers
+            for strip in layer.strips
+            for bag in strip.channelbags
+            for fc in bag.fcurves
+        ]
+    for fc in fcurves:
         m = _FCURVE_PATH_RE.match(fc.data_path)
         if not m:
             continue
@@ -172,6 +183,8 @@ def _bind_action(armature, action):
     if ad is None:
         ad = armature.animation_data_create()
     ad.action = action
+    if hasattr(action, "slots") and len(action.slots) == 1:
+        ad.action_slot = action.slots[0]
     if hasattr(ad, "action_blend_type"):
         ad.action_blend_type = "REPLACE"
     if hasattr(ad, "action_extrapolation"):
@@ -282,9 +295,15 @@ def main():
         n_frames = f_end - f_start + 1
 
         idx = _build_action_fcurve_index(action)
+        if not idx:
+            print(f"Skipping action without bone animation: {action.name}")
+            continue
+        _bind_action(armature, action)
         pos = np.zeros((n_frames, len(bone_names), 3), dtype=np.float32)
         rot = np.zeros((n_frames, len(bone_names), 3, 3), dtype=np.float32)
         for i, f in enumerate(range(f_start, f_end + 1)):
+            # Object-level root motion is animated separately from pose bones.
+            bpy.context.scene.frame_set(f)
             basis = _build_bone_basis_matrices(bpy, idx, bone_names, f, rotation_modes)
             p, r = _sample_pose_from_fcurves(
                 bpy, armature, bone_chain, basis, parent_rel, root_rest

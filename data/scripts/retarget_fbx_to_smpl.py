@@ -39,6 +39,14 @@ Usage::
         c:/path/to/KB_Movement.fbx \
         --output-dir data/yaml_files/FightingAnimsetPro/
 
+Orientation is unchanged by default. Pass ``--auto-correct`` (also accepted as
+``--auto_correct``) to align the first retained pelvis to forward +X and up +Z.
+This assumes that frame should be upright and forward-facing. For explicit
+control, pass ``--rotation-euler X Y Z`` in degrees; fixed-world-axis X, then Y,
+then Z rotations are applied after auto correction when both options are used.
+The same constant rotation is applied to the pose and root trajectory before
+velocities, height anchoring, and contacts are computed.
+
 By default the script will call Blender automatically; pass
 ``--skip-extract --extracted-pkl path/to.pkl`` to reuse a previous extraction.
 """
@@ -145,6 +153,24 @@ RIG_PROFILE_KIMODO: RigProfile = {
 RIG_PROFILES: Dict[str, RigProfile] = {
     "mixamo": RIG_PROFILE_MIXAMO,
     "kimodo": RIG_PROFILE_KIMODO,
+    "biped": {
+        "Pelvis": "Bip001 Pelvis",
+        "Torso": "Bip001 Spine",
+        "Spine": "Bip001 Spine1",
+        "Chest": "Bip001 Spine2",
+        "Neck": "Bip001 Neck",
+        "Head": "Bip001 Head",
+        **{
+            f"{side}_{joint}": f"Bip001 {side} {bone}"
+            for side in ("L", "R")
+            for joint, bone in (
+                ("Hip", "Thigh"), ("Knee", "Calf"), ("Ankle", "Foot"),
+                ("Toe", "Toe0"), ("Thorax", "Clavicle"),
+                ("Shoulder", "UpperArm"), ("Elbow", "Forearm"),
+                ("Wrist", "Hand"),
+            )
+        },
+    },
 }
 
 
@@ -537,6 +563,31 @@ def retarget_action(
 # ---- Main pipeline -------------------------------------------------------- #
 
 
+def _orientation_correction(
+    first_root_rotation: np.ndarray,
+    auto_correct: bool = False,
+    rotation_euler: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> np.ndarray:
+    """Constant world rotation: auto alignment, then fixed-axis X/Y/Z degrees.
+
+    Auto alignment assumes the first retained pelvis orientation should be
+    identity (forward +X, left +Y, up +Z), including pitch and roll. It is not
+    suitable for a first frame intentionally lying down or leaning; use manual
+    angles in that case. Manual rotations compose as Rz @ Ry @ Rx.
+    """
+    angles = np.asarray(rotation_euler, dtype=np.float64)
+    if angles.shape != (3,) or not np.isfinite(angles).all():
+        raise ValueError("rotation_euler must contain three finite angles in degrees")
+    x, y, z = np.deg2rad(angles)
+    cx, cy, cz = np.cos([x, y, z])
+    sx, sy, sz = np.sin([x, y, z])
+    rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    auto = _ortho_normalize(first_root_rotation).T if auto_correct else np.eye(3)
+    return rz @ ry @ rx @ auto
+
+
 def _process_action(
     name: str,
     action: dict,
@@ -556,6 +607,8 @@ def _process_action(
     trim_rot_threshold: float = 0.005,
     trim_pos_threshold: float = 0.0008,
     trim_pad_frames: int = 1,
+    auto_correct: bool = False,
+    rotation_euler: Tuple[float, float, float] = (0.0, 0.0, 0.0),
 ):
     src_world_rot = _ortho_normalize_batch(action["world_rot"])  # strip Blender scale
     src_world_pos = action["world_pos"]  # (T, J, 3)
@@ -607,7 +660,7 @@ def _process_action(
             print(f"  [skip] {name}: only {src_world_rot.shape[0]} frame(s) after trim")
             return
 
-    root_pos, _, smpl_local = retarget_action(
+    root_pos, smpl_world, smpl_local = retarget_action(
         source_world_rot=src_world_rot,
         source_root_pos=src_root_pos,
         source_rest_world_rot=_ortho_normalize_batch(source_data["rest_world_rot"]),
@@ -622,6 +675,19 @@ def _process_action(
         dtype=dtype,
         foot_offset=foot_offset,
     )
+
+    if auto_correct or any(rotation_euler):
+        correction = _orientation_correction(
+            smpl_world[0, 0].cpu().numpy(), auto_correct, rotation_euler
+        )
+        correction_t = torch.as_tensor(correction, device=device, dtype=dtype)
+        # Rotate the trajectory about its initial pelvis, preserving distances.
+        origin = root_pos[0].clone()
+        root_pos = (root_pos - origin) @ correction_t.T + origin
+        # A uniform world rotation changes only the root's local rotation.
+        # Keep all other local rotations exact (avoids exp-map roundoff).
+        smpl_local[:, 0] = correction_t @ smpl_local[:, 0]
+        print(f"  orientation: auto_correct={auto_correct}, Euler XYZ={rotation_euler} degrees")
 
     motion = fk_from_transforms_with_velocities(
         kinematic_info=kinematic_info,
@@ -817,6 +883,14 @@ def main(
         help="Where to write per-action .motion files.",
     ),
     output_fps: int = typer.Option(30, help="Target output FPS for .motion files."),
+    auto_correct: bool = typer.Option(
+        False, "--auto-correct", "--auto_correct",
+        help="Rotate the whole clip so the first retained pelvis faces +X with +Z up. Assumes that frame is upright and forward-facing; corrects pitch, roll and yaw.",
+    ),
+    rotation_euler: Tuple[float, float, float] = typer.Option(
+        (0.0, 0.0, 0.0), "--rotation-euler",
+        help="World X Y Z rotation offsets in degrees, applied in that order after auto correction. Example: --rotation-euler 0 90 0. Default leaves orientation unchanged.",
+    ),
     foot_offset: float = typer.Option(0.015, help="Height-fix foot offset (smpl=0.015, smplx=0.017)."),
     extracted_pkl: Optional[Path] = typer.Option(
         None,
@@ -1025,6 +1099,8 @@ def main(
                 trim_rot_threshold=trim_rot_threshold,
                 trim_pos_threshold=trim_pos_threshold,
                 trim_pad_frames=trim_pad_frames,
+                auto_correct=auto_correct,
+                rotation_euler=rotation_euler,
             )
         except Exception as e:  # noqa: BLE001
             import traceback
