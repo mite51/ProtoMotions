@@ -69,6 +69,21 @@ A config-only check does not start the simulator or training:
 EXPERIMENT_NAME=check_extended scripts/train_fighting_comparison.sh extended --create-config-only
 ```
 
+For inference with the active `protomotion_isaaclab_12` environment:
+
+```bash
+python protomotions/inference_agent.py \
+  --checkpoint results/smpl_baseline_amass_s0/last.ckpt \
+  --motion-file /home/jwylie/Dev/ProtomotionsAnimData/CMU/37/37_01_poses.motion \
+  --simulator isaaclab --num-envs 1
+```
+
+Direct inference launches now put this checkout first on Python's import path,
+before importing simulator code. This prevents the environment's editable install
+from mixing in `ProtoMotions_isaaclab_12` and rejecting frozen reward arguments
+such as `mean_before_exp`. The fix does not change checkpoint weights or rewards.
+For module launches, use `PYTHONPATH=. python -m protomotions.inference_agent`.
+
 ## Compare behavior before introducing custom animation
 
 Use main's full 600-step evaluator, including failure rate, global position and

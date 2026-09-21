@@ -4,6 +4,8 @@
 """Script-level tests for inference_agent.py with runtime boundaries faked."""
 
 import runpy
+import os
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -15,6 +17,34 @@ from protomotions.components.motion_lib import MotionLibConfig
 
 
 INFERENCE_AGENT_PATH = str(Path(__file__).resolve().parents[1] / "inference_agent.py")
+
+
+def test_direct_inference_prefers_own_checkout_before_simulator_import(tmp_path):
+    # Reproduce a competing checkout installed/on PYTHONPATH. Stop at the
+    # simulator import boundary so this test needs neither IsaacLab nor a GPU.
+    shadow = tmp_path / "other_checkout"
+    package = shadow / "protomotions"
+    (package / "utils").mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "utils" / "__init__.py").write_text("")
+    probe = '''
+import runpy, sys
+class StopBeforeSimulator:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "protomotions.utils.simulator_imports":
+            print(sys.modules["protomotions"].__file__)
+            raise SystemExit(0)
+sys.meta_path.insert(0, StopBeforeSimulator())
+script = sys.argv[1]
+sys.argv = [script, "--checkpoint", "unused.ckpt", "--simulator", "isaaclab"]
+runpy.run_path(script, run_name="__main__")
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", probe, INFERENCE_AGENT_PATH],
+        cwd=tmp_path, env={**os.environ, "PYTHONPATH": str(shadow)},
+        capture_output=True, text=True, check=True,
+    )
+    assert Path(result.stdout.strip()).resolve() == Path(INFERENCE_AGENT_PATH).with_name("__init__.py")
 
 
 class _FakeFabricConfig:

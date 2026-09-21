@@ -182,6 +182,14 @@ def create_parser():
 
 # Parse arguments first (argparse is safe, doesn't import torch)
 import argparse  # noqa: E402
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+# A direct file launch puts protomotions/ rather than the repository root on
+# sys.path. Prefer the checkout containing this script over an editable install
+# of another checkout, before importing any ProtoMotions or simulator modules.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 parser = create_parser()
 args, unknown_args = parser.parse_known_args()
@@ -194,7 +202,6 @@ AppLauncher = import_simulator_before_torch(args.simulator)
 
 # Now safe to import everything else including torch
 import logging  # noqa: E402
-from pathlib import Path  # noqa: E402
 import torch  # noqa: E402
 from protomotions.utils.hydra_replacement import get_class  # noqa: E402
 from protomotions.utils.fabric_config import FabricConfig  # noqa: E402
