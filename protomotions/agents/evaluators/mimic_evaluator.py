@@ -381,10 +381,15 @@ class MimicEvaluator(BaseEvaluator):
                     f"Missing metric '{k}' required to build predicted MotionLib"
                 )
 
-        device = self.device
+        # Export is serialization work: keep packed outputs on the host. Keeping
+        # GPU clones of every clip, followed by torch.cat, duplicates gigabytes
+        # alongside the motion library, rollout buffers and evaluation metrics.
+        device = torch.device("cpu")
         num_motions = self.motion_lib.num_motions()
 
         motion_num_frames = metrics["dof_pos"].motion_lens.to(device=device).long()
+        max_available_frames = min(metrics[k].data.shape[1] for k in required_keys)
+        motion_num_frames = motion_num_frames.clamp(max=max_available_frames)
         assert (
             motion_num_frames.shape[0] == num_motions
         ), "motion_num_frames size mismatch"
@@ -416,14 +421,21 @@ class MimicEvaluator(BaseEvaluator):
         )
         motion_lengths = motion_num_frames.to(dtype=torch.float32) * self.env.dt
 
-        def pack_metric(metric_key: str) -> torch.Tensor:
+        frame_lengths = motion_num_frames.tolist()
+        frame_starts = length_starts.tolist()
+        total_frames = sum(frame_lengths)
+
+        def pack_metric(metric_key: str, dtype=None) -> torch.Tensor:
             data = metrics[metric_key].data
-            per_motion = []
-            for m in range(num_motions):
-                f = motion_num_frames[m].item()
-                f = min(f, data.shape[1])
-                per_motion.append(data[m, :f].detach().clone())
-            return torch.cat(per_motion, dim=0)
+            packed = torch.empty(
+                (total_frames, *data.shape[2:]),
+                dtype=data.dtype if dtype is None else dtype,
+                device=device,
+            )
+            for m, (start, frames) in enumerate(zip(frame_starts, frame_lengths)):
+                if frames:
+                    packed[start : start + frames].copy_(data[m, :frames].detach())
+            return packed
 
         # Build packed tensors matching MotionLib field names
         dps = pack_metric("dof_pos")  # [total_frames, num_dofs]
@@ -483,7 +495,7 @@ class MimicEvaluator(BaseEvaluator):
             # Strip the spawn-only ref_respawn_offset from z; keep terrain
             # correction and scene xy.
             env_offsets[:, 2] -= float(self.env.config.ref_respawn_offset)
-            per_motion_offset[unique_motion_ids] = env_offsets
+            per_motion_offset[unique_motion_ids.to(device=device)] = env_offsets
         for m in range(num_motions):
             nframes = int(motion_num_frames[m].item())
             if nframes == 0:
@@ -492,17 +504,7 @@ class MimicEvaluator(BaseEvaluator):
             gts[start : start + nframes] -= per_motion_offset[m].view(1, 1, 3)
 
         # Pack predicted contacts from metrics
-        contacts_data = metrics[
-            "rigid_body_contacts"
-        ].data  # [num_motions, max_frames, num_bodies]
-        contacts_list = []
-        for m in range(num_motions):
-            f = motion_num_frames[m].item()
-            # Clamp to available frames
-            f = min(f, contacts_data.shape[1])
-            # Convert float contacts to bool for consistency with MotionLib format
-            contacts_list.append(contacts_data[m, :f].bool().detach().clone())
-        contacts = torch.cat(contacts_list, dim=0)
+        contacts = pack_metric("rigid_body_contacts", dtype=torch.bool)
 
         # Copy ground-truth motion weights and files
         gt_lib = self.motion_lib
@@ -510,7 +512,7 @@ class MimicEvaluator(BaseEvaluator):
             gt_lib,
             "motion_weights",
             torch.ones(num_motions, dtype=torch.float32, device=device),
-        )
+        ).detach().to(device=device)
         motion_files = getattr(
             gt_lib,
             "motion_files",

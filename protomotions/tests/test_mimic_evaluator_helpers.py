@@ -495,10 +495,14 @@ def test_mimic_plot_per_frame_metrics_prefers_available_eval_component_keys(
     assert calls[0][1]["output_filename"] == "metrics_per_frame_plot.png"
 
 
+@pytest.mark.parametrize("simulation_device", ["cpu", "cuda"])
 def test_mimic_save_predicted_motion_lib_packs_fields_and_removes_replay_offset(
-    tmp_path,
+    tmp_path, simulation_device,
 ):
     evaluator = _evaluator(tmp_path)
+    # Serialization must not allocate on the simulation device, even when a
+    # caller supplies already-host-resident metrics from a CUDA simulation.
+    evaluator.fabric.device = torch.device(simulation_device)
     motion_lens = torch.tensor([2, 1, 0])
     metrics = {
         "dof_pos": _packed_metric(motion_lens, features=2),
@@ -524,6 +528,8 @@ def test_mimic_save_predicted_motion_lib_packs_fields_and_removes_replay_offset(
     evaluator._save_predicted_motion_lib(metrics, epoch=3)
 
     saved = torch.load(tmp_path / "results" / "predicted_motion_lib_epoch_3.pt")
+    assert all(value.device.type == "cpu" for value in saved.values()
+               if isinstance(value, torch.Tensor))
     assert torch.equal(saved["motion_num_frames"], motion_lens)
     assert torch.equal(saved["length_starts"], torch.tensor([0, 2, 3]))
     assert saved["gts"].shape == (3, 1, 3)
