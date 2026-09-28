@@ -166,6 +166,7 @@ def export_tracker(
     checkpoint: str,
     output_dir: str,
     validate: bool = True,
+    target_simulator: str | None = None,
 ) -> Path:
     """Export the tracker policy to a unified ONNX model.
 
@@ -177,6 +178,8 @@ def export_tracker(
         Directory where ONNX + YAML files will be written.
     validate:
         If True, run onnxruntime validation after export.
+    target_simulator:
+        Optional explicit deployment conversion. Defaults to saved training cadence.
 
     Returns
     -------
@@ -242,49 +245,24 @@ def export_tracker(
         num_future_steps = len(raw_future_steps)
         future_step_indices = list(raw_future_steps)
 
-    # Resolve MuJoCo-specific timing.
-    # The resolved config may be from a different training simulator
-    # (e.g., IsaacLab fps=200, dec=4).  We apply the sim2sim conversion to
-    # get the correct MuJoCo timing (fps=1000, dec=20, dt=0.001).
-    # control_dt stays the same (0.02) across all simulators.
-    control_dt = 0.02
-    physics_dt = 0.001
-    decimation = 20
-    pd_target_max_accel = None
-    if simulator_config is not None:
-        # Apply sim2sim conversion to MuJoCo defaults
-        try:
-            from protomotions.simulator.factory import update_simulator_config_for_test
-            mj_sim_cfg = update_simulator_config_for_test(
-                current_simulator_config=simulator_config,
-                new_simulator="mujoco",
-                robot_config=robot_config,
-            )
-            physics_dt = 1.0 / mj_sim_cfg.sim.fps
-            decimation = mj_sim_cfg.sim.decimation
-            control_dt = physics_dt * decimation
-        except Exception as e:
-            log.warning(f"Could not apply sim2sim conversion: {e}")
-            # Fallback: read from raw config
-            sim_cfg = getattr(simulator_config, "sim", None)
-            if sim_cfg is not None:
-                _fps = getattr(sim_cfg, "fps", None)
-                _dec = getattr(sim_cfg, "decimation", None)
-                if _fps and _dec:
-                    physics_dt = 1.0 / _fps
-                    decimation = _dec
-                    control_dt = physics_dt * decimation
-        _accel = getattr(simulator_config, "pd_target_max_accel", None)
-        if _accel is not None:
-            pd_target_max_accel = float(_accel)
+    # Training timing is loaded separately from the inference/graph config.
+    # Target conversion is opt-in and recorded separately in the sidecar.
+    from protomotions.utils.export_timing import resolve_export_timing
+
+    timing = resolve_export_timing(
+        checkpoint_path, resolved, resolved_path, future_step_indices, target_simulator
+    )
+    pd_target_max_accel = getattr(simulator_config, "pd_target_max_accel", None)
+    if pd_target_max_accel is not None:
+        pd_target_max_accel = float(pd_target_max_accel)
 
     log.info(
         f"Robot: {num_dofs} DOFs, {num_bodies} bodies, "
         f"anchor={anchor_body_name}(idx={anchor_body_index})"
     )
     log.info(
-        f"Timing: control_dt={control_dt}s  physics_dt={physics_dt}s  "
-        f"decimation={decimation}"
+        f"Timing ({timing['basis']}): control_dt={timing['control_dt']}s  "
+        f"physics_dt={timing['physics_dt']}s  decimation={timing['decimation']}"
     )
     log.info(f"Future steps: {future_step_indices} ({num_future_steps} total)")
 
@@ -525,9 +503,7 @@ def export_tracker(
         num_bodies=num_bodies,
         num_dofs=num_dofs,
         mjcf_path=mjcf_path,
-        control_dt=control_dt,
-        physics_dt=physics_dt,
-        decimation=decimation,
+        timing=timing,
         future_step_indices=future_step_indices,
         obs_future_step_selections=obs_future_step_selections,
         checkpoint=str(checkpoint_path),
@@ -565,14 +541,13 @@ def _build_yaml(
     num_bodies,
     num_dofs,
     mjcf_path,
-    control_dt,
-    physics_dt,
-    decimation,
+    timing,
     future_step_indices,
     obs_future_step_selections,
     checkpoint,
 ) -> dict:
     """Build the rich YAML metadata dict."""
+    from protomotions.utils.export_timing import future_dt_seconds
 
     # Describe each ONNX input in human-readable terms
     deploy_inputs = {}
@@ -643,6 +618,7 @@ def _build_yaml(
         deploy_inputs[key] = entry
 
     content = {
+        "dt": timing["control_dt"],
         # Runtime metadata used by deploy scripts
         "_runtime": {
             "onnx_in_names": onnx_in_names,
@@ -690,15 +666,11 @@ def _build_yaml(
             ),
         },
         # Timing
-        "timing": {
-            "control_dt": control_dt,
-            "physics_dt": physics_dt,
-            "decimation": decimation,
-        },
+        "timing": timing,
         # Reference motion info
         "motion": {
             "future_step_indices": future_step_indices,
-            "future_dt_seconds": [round(s * control_dt, 6) for s in future_step_indices],
+            "future_dt_seconds": future_dt_seconds(timing, future_step_indices),
             "note": (
                 "Provide all future_step_indices frames to the ONNX model. "
                 "The obs function internally selects a subset."
@@ -750,6 +722,12 @@ def _parse_args():
         default=False,
         help="Skip onnxruntime validation after export",
     )
+    p.add_argument(
+        "--target-simulator",
+        choices=["mujoco", "isaaclab", "isaacgym", "genesis", "newton"],
+        default=None,
+        help="Explicit deployment cadence conversion (default: saved training timing)",
+    )
     return p.parse_args()
 
 
@@ -764,6 +742,7 @@ if __name__ == "__main__":
         checkpoint=args.checkpoint,
         output_dir=out,
         validate=not args.no_validate,
+        target_simulator=args.target_simulator,
     )
     log.info(f"\nDone!  Model exported to: {onnx_file}")
     log.info(f"YAML sidecar: {onnx_file.with_suffix('.yaml')}")
