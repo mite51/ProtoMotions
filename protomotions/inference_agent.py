@@ -85,6 +85,28 @@ def create_parser():
     parser.add_argument(
         "--checkpoint", type=str, required=True, help="Path to checkpoint file to test"
     )
+    parser.add_argument(
+        "--compare-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Optional second checkpoint to run side-by-side in the same simulator window. "
+            "Even envs (0, 2, 4, ...) run --checkpoint; odd envs (1, 3, 5, ...) run "
+            "--compare-checkpoint on the exact same synchronized motion clips."
+        ),
+    )
+    parser.add_argument(
+        "--pair-spacing",
+        type=float,
+        default=1.5,
+        help="Y-axis spacing (meters) between each (Policy A, Policy B) character pair when --compare-checkpoint is used.",
+    )
+    parser.add_argument(
+        "--max-compare-steps",
+        type=int,
+        default=None,
+        help="Optional maximum number of steps to run in --compare-checkpoint mode before exiting.",
+    )
     # Optional arguments
     parser.add_argument(
         "--full-eval",
@@ -355,9 +377,39 @@ def main():
     # robot_config.control.control_type = ControlType.PROPORTIONAL
 
     # Apply CLI runtime overrides
+    if args.compare_checkpoint is not None:
+        compare_ckpt_path = Path(args.compare_checkpoint)
+        resolved_b_path = compare_ckpt_path.parent / "resolved_configs_inference.pt"
+        if not resolved_b_path.exists():
+            resolved_b_path = compare_ckpt_path.parent / "resolved_configs.pt"
+        if resolved_b_path.exists():
+            rc_b_pre = torch.load(resolved_b_path, map_location="cpu", weights_only=False)
+            env_cfg_b_pre = rc_b_pre.get("env", None)
+            if (
+                env_cfg_b_pre is not None
+                and getattr(env_cfg_b_pre, "observation_components", None) is not None
+            ):
+                if env_config.observation_components is None:
+                    env_config.observation_components = {}
+                for obs_k, obs_v in env_cfg_b_pre.observation_components.items():
+                    if obs_k not in env_config.observation_components:
+                        log.info(
+                            f"Merging observation component '{obs_k}' from compare-checkpoint into env_config"
+                        )
+                        env_config.observation_components[obs_k] = obs_v
+
     if args.num_envs is not None:
+        if args.compare_checkpoint is not None and args.num_envs < 2:
+            args.num_envs = 2
+        if args.compare_checkpoint is not None and args.num_envs % 2 != 0:
+            args.num_envs += 1
         log.info(f"CLI override: num_envs = {args.num_envs}")
         simulator_config.num_envs = args.num_envs
+    elif args.compare_checkpoint is not None:
+        if simulator_config.num_envs < 2:
+            simulator_config.num_envs = 2
+        elif simulator_config.num_envs % 2 != 0:
+            simulator_config.num_envs += 1
 
     if args.motion_file is not None:
         log.info(f"CLI override: motion_file = {args.motion_file}")
@@ -564,12 +616,209 @@ def main():
             if evaluated_score is not None:
                 print(f"  Overall Score: {evaluated_score:.6f}")
             print("=" * 60 + "\n")
+        elif args.compare_checkpoint is not None:
+            run_side_by_side_comparison(
+                env=env,
+                agent_a=agent,
+                checkpoint_a=Path(args.checkpoint),
+                checkpoint_b=Path(args.compare_checkpoint),
+                pair_spacing=float(args.pair_spacing),
+                max_steps=args.max_compare_steps,
+            )
         else:
             agent.evaluator.simple_test_policy(collect_metrics=True)
     finally:
         # Ensure simulator viewer is properly closed (prevents hangs)
         if hasattr(env.simulator, "shutdown"):
             env.simulator.shutdown()
+
+
+def run_side_by_side_comparison(
+    env,
+    agent_a,
+    checkpoint_a: Path,
+    checkpoint_b: Path,
+    pair_spacing: float = 1.5,
+    max_steps: int = None,
+) -> None:
+    """Run two checkpoints side-by-side in synchronized (even=A, odd=B) environment pairs."""
+    import inspect
+    from tensordict import TensorDict
+
+    resolved_b_path = checkpoint_b.parent / "resolved_configs_inference.pt"
+    if not resolved_b_path.exists():
+        resolved_b_path = checkpoint_b.parent / "resolved_configs.pt"
+    rc_b = torch.load(resolved_b_path, map_location="cpu", weights_only=False)
+    agent_cfg_b = rc_b["agent"]
+    env_cfg_b = rc_b["env"]
+
+    ModelClassB = get_class(agent_cfg_b.model._target_)
+    model_b = ModelClassB(config=agent_cfg_b.model).to(env.device)
+
+    # Materialize lazy modules in model_b using a dummy observation from env
+    obs_init, _ = env.reset()
+    obs_init = agent_a.add_agent_info_to_obs(obs_init)
+    obs_td_init = agent_a.obs_dict_to_tensordict(obs_init)
+    with torch.no_grad():
+        model_b(obs_td_init.clone())
+
+    ckpt_b_data = torch.load(checkpoint_b, map_location=env.device, weights_only=False)
+    model_b.load_state_dict(ckpt_b_data["model"], strict=True)
+    model_b.eval()
+    agent_a.eval()
+
+    num_envs = env.num_envs
+    even_ids = torch.arange(0, num_envs, 2, device=env.device, dtype=torch.long)
+    odd_ids = torch.arange(1, num_envs, 2, device=env.device, dtype=torch.long)
+
+    # Move action_config_b tensors to env.device and wrap env._process_action so
+    # even_ids use Policy A's action_config (e.g., tanh) and odd_ids use Policy B's
+    # action_config (e.g., clamp), while keeping raw actions intact in state_history.
+    orig_process_action = env._process_action
+    action_cfg_b = getattr(env_cfg_b, "action_config", None)
+    if action_cfg_b is not None:
+        action_cfg_b = {
+            k: (v.to(env.device) if isinstance(v, torch.Tensor) else v)
+            for k, v in action_cfg_b.items()
+        }
+
+        def _process_action_pair(action: torch.Tensor, context) -> dict:
+            out_a = orig_process_action(action, context)
+            fn_b = action_cfg_b["fn"]
+            params_b = {k: v for k, v in action_cfg_b.items() if k != "fn"}
+            if (
+                "stamina" in inspect.signature(fn_b).parameters
+                and getattr(env, "_stamina", None) is not None
+            ):
+                params_b["stamina"] = env._stamina
+            out_b = fn_b(action=action, **params_b)
+            merged = {}
+            for k in out_a.keys():
+                t = out_a[k].clone()
+                if k in out_b:
+                    t[odd_ids] = out_b[k][odd_ids]
+                merged[k] = t
+            return merged
+
+        env._process_action = _process_action_pair
+
+    def _sync_pairs(reset_env_ids: torch.Tensor) -> None:
+        """Synchronize motion_ids, motion_times, and side-by-side positions for reset pairs."""
+        if reset_env_ids is None:
+            pair_ids = torch.arange(num_envs // 2, device=env.device, dtype=torch.long)
+        elif reset_env_ids.numel() == 0:
+            return
+        else:
+            pair_ids = torch.unique(reset_env_ids // 2, sorted=True)
+
+        ev = pair_ids * 2
+        od = pair_ids * 2 + 1
+        all_ids = torch.stack([ev, od], dim=1).reshape(-1)
+
+        if env.motion_manager is not None:
+            env.motion_manager.sample_motions(ev)
+            env.motion_manager.motion_ids[od] = env.motion_manager.motion_ids[ev]
+            env.motion_manager.motion_times[od] = env.motion_manager.motion_times[ev]
+
+            m_ids = env.motion_manager.motion_ids[all_ids]
+            m_times = env.motion_manager.motion_times[all_ids]
+            new_states, new_obj_states = env.compute_ref_reset_state(
+                all_ids, m_ids, m_times, sample_flat=False
+            )
+            # Place odd env (Policy B) right next to even env (Policy A) offset by +pair_spacing in Y
+            env.respawn_root_offset[od, 0] = env.respawn_root_offset[ev, 0]
+            env.respawn_root_offset[od, 1] = env.respawn_root_offset[ev, 1] + pair_spacing
+            env.respawn_root_offset[od, 2] = env.respawn_root_offset[ev, 2]
+
+            ref_state = env.motion_lib.get_motion_state(m_ids, m_times)
+            from protomotions.simulator.base_simulator.simulator_state import ResetState
+
+            new_states = ResetState.from_robot_state(ref_state).clone()
+            new_states.root_pos += env.respawn_root_offset[all_ids]
+            env.simulator.reset_envs(new_states, new_obj_states, all_ids)
+
+            if env.state_history is not None:
+                mask_false = torch.zeros(
+                    all_ids.numel(), dtype=torch.bool, device=env.device
+                )
+                env._reset_state_history(all_ids, mask_false, all_ids, m_ids, m_times)
+            env.control_manager.reset(all_ids)
+            env.progress_buf[all_ids] = 0
+            env.reset_buf[all_ids] = False
+            env.terminate_buf[all_ids] = False
+            env._current_raw_action[all_ids] = 0.0
+            env._current_processed_action[all_ids] = 0.0
+            env._current_context = None
+
+    name_a = f"{checkpoint_a.parent.name}/{checkpoint_a.name}"
+    name_b = f"{checkpoint_b.parent.name}/{checkpoint_b.name}"
+    print("\n" + "=" * 78)
+    print("SIDE-BY-SIDE LIVE COMPARISON")
+    print(f"  Even Envs [0, 2, ...] (Left) : Policy A = {name_a}")
+    print(f"  Odd  Envs [1, 3, ...] (Right, +{pair_spacing}m Y): Policy B = {name_b}")
+    print("  Both characters in each pair track the EXACT same motion clip in sync.")
+    print("  Press 'R' in viewer to resample motions, 'J' to push, Ctrl+C to stop.")
+    print("=" * 78 + "\n")
+
+    _sync_pairs(None)
+    obs = env.get_obs()
+    step = 0
+    falls_a = 0
+    falls_b = 0
+
+    try:
+        while True:
+            agent_a.pre_collect_step(step)
+            obs = agent_a.add_agent_info_to_obs(obs)
+            obs_td = agent_a.obs_dict_to_tensordict(obs)
+
+            with torch.no_grad():
+                td_a = agent_a.model._actor(obs_td.clone())
+                act_a = td_a["mean_action"]
+
+                td_b = model_b._actor(obs_td.clone())
+                act_b = td_b["mean_action"]
+
+            combined_action = act_a.clone()
+            combined_action[odd_ids] = act_b[odd_ids]
+
+            obs, _, dones, terminated, _ = env.step(combined_action)
+
+            if terminated.any():
+                falls_a += int(terminated[even_ids].sum().item())
+                falls_b += int(terminated[odd_ids].sum().item())
+
+            if (env.progress_buf == 0).all():
+                # User pressed 'R' in viewer to reset all environments
+                _sync_pairs(None)
+                obs = env.get_obs()
+            elif dones.any():
+                done_ids = dones.nonzero(as_tuple=False).squeeze(-1)
+                _sync_pairs(done_ids)
+                obs = env.get_obs()
+
+            step += 1
+            if step % 150 == 0:
+                print(
+                    f"[Step {step:5d}] Cumulative Falls/Terminations -> "
+                    f"Policy A ({checkpoint_a.parent.name}): {falls_a} | "
+                    f"Policy B ({checkpoint_b.parent.name}): {falls_b}",
+                    flush=True,
+                )
+            if max_steps is not None and step >= max_steps:
+                print(
+                    f"Reached max_compare_steps={max_steps}. Total falls -> "
+                    f"Policy A ({checkpoint_a.parent.name}): {falls_a} | "
+                    f"Policy B ({checkpoint_b.parent.name}): {falls_b}",
+                    flush=True,
+                )
+                break
+    except KeyboardInterrupt:
+        print(
+            f"\nStopped after {step} steps. Total falls -> "
+            f"Policy A ({checkpoint_a.parent.name}): {falls_a} | "
+            f"Policy B ({checkpoint_b.parent.name}): {falls_b}"
+        )
 
 
 if __name__ == "__main__":

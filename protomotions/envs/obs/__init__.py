@@ -82,6 +82,18 @@ from protomotions.envs.obs.collision_primitives import (
 # Per-body stamina observation compute kernel
 from protomotions.envs.obs.stamina import compute_stamina_obs
 
+# Analytical subtree load & per-joint Mini-Brain feature kernels
+from protomotions.envs.obs.joint_load_obs import (
+    JOINT_LOAD_FEATURE_DIM,
+    MINIBRAIN_FEATURE_DIM,
+    SubtreeTopology,
+    build_subtree_topology,
+    compute_analytical_subtree_load,
+    compute_joint_load_obs,
+    compute_minibrain_joint_features,
+    compute_analytical_pd_lead_action,
+)
+
 # Observation noise utilities
 from protomotions.envs.obs.observation_noise import (
     NoisyObservations,
@@ -143,6 +155,15 @@ __all__ = [
     "PRIMITIVE_FEATURE_DIM",
     # Per-body stamina observation compute kernel
     "compute_stamina_obs",
+    # Analytical subtree load & per-joint Mini-Brain feature kernels
+    "JOINT_LOAD_FEATURE_DIM",
+    "MINIBRAIN_FEATURE_DIM",
+    "SubtreeTopology",
+    "build_subtree_topology",
+    "compute_analytical_subtree_load",
+    "compute_joint_load_obs",
+    "compute_minibrain_joint_features",
+    "compute_analytical_pd_lead_action",
     # Observation noise utilities
     "NoisyObservations",
     "apply_observation_noise",

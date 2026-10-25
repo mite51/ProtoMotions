@@ -342,6 +342,9 @@ def detect_checkpoint_mode(args, save_dir):
     if pre_existing_checkpoint.exists():
         log.info(f"RESUME: Found checkpoint in save_dir: {pre_existing_checkpoint}")
 
+        cli_training_max_steps = getattr(args, "training_max_steps", None)
+        cli_training_max_iterations = getattr(args, "training_max_iterations", None)
+
         # Load wandb_id
         wandb_id = None
         if checkpoint_config_path.exists():
@@ -353,6 +356,13 @@ def detect_checkpoint_mode(args, save_dir):
             for key, value in checkpoint_config.items():
                 if key != "wandb_id":
                     setattr(args, key, value)
+            if (
+                cli_training_max_steps is not None
+                and cli_training_max_steps != 10000000000000
+            ):
+                args.training_max_steps = cli_training_max_steps
+            if cli_training_max_iterations is not None:
+                args.training_max_iterations = cli_training_max_iterations
             wandb_id = checkpoint_config.get("wandb_id", None)
         else:
             raise FileNotFoundError(
@@ -656,6 +666,16 @@ def main():
         motion_lib_config = resolved_configs["motion_lib"]
         env_config = resolved_configs["env"]
         agent_config = resolved_configs["agent"]
+        if (
+            getattr(args, "training_max_steps", None) is not None
+            and args.training_max_steps != agent_config.training_max_steps
+        ):
+            log.info(
+                f"RESUME: Updating agent_config.training_max_steps from "
+                f"{agent_config.training_max_steps} to {args.training_max_steps}"
+            )
+            agent_config.training_max_steps = args.training_max_steps
+        apply_training_iteration_limit(args, agent_config)
         motion_lib_config.validate()
 
         args.checkpoint = checkpoint_path

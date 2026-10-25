@@ -178,6 +178,163 @@ def stamina_obs_factory() -> MdpComponent:
     )
 
 
+def joint_load_obs_factory(
+    robot_cfg: Any,
+    use_noisy: bool = False,
+    body_masses: Optional[torch.Tensor] = None,
+    torque_scale: float = 0.01,
+    momentum_scale: float = 0.1,
+    mass_scale: float = 0.05,
+    inertia_scale: float = 0.5,
+) -> MdpComponent:
+    """Factory for the analytical subtree load observation (`[num_envs, num_joints * 8]`).
+
+    Computes per-joint gravitational torque, subtree angular momentum, static subtree
+    mass, and dynamic effective inertia in each joint's local parent frame.
+    """
+    from protomotions.envs.obs.joint_load_obs import (
+        build_subtree_topology,
+        compute_joint_load_obs,
+    )
+
+    topology = build_subtree_topology(robot_cfg, body_masses=body_masses)
+    state = EnvContext.noisy if use_noisy else EnvContext.current
+
+    return MdpComponent(
+        compute_func=compute_joint_load_obs,
+        dynamic_vars={
+            "body_pos": state.rigid_body_pos,
+            "body_rot": state.rigid_body_rot,
+            "body_vel": state.rigid_body_vel,
+            "body_ang_vel": state.rigid_body_ang_vel,
+        },
+        static_params={
+            "subtree_mask": topology.subtree_mask,
+            "body_masses": topology.body_masses,
+            "joint_body_indices": topology.joint_body_indices,
+            "parent_body_indices": topology.parent_body_indices,
+            "body_com_offset": topology.body_com_offset,
+            "w_last": True,
+            "torque_scale": torque_scale,
+            "momentum_scale": momentum_scale,
+            "mass_scale": mass_scale,
+            "inertia_scale": inertia_scale,
+        },
+    )
+
+
+def _compute_minibrain_features_from_mimic_context(
+    dof_pos: torch.Tensor,
+    dof_vel: torch.Tensor,
+    future_dof_pos: torch.Tensor,
+    future_dof_vel: torch.Tensor,
+    body_pos: torch.Tensor,
+    body_rot: torch.Tensor,
+    body_vel: torch.Tensor,
+    body_ang_vel: torch.Tensor,
+    body_stamina: Optional[torch.Tensor] = None,
+    subtree_mask: Optional[torch.Tensor] = None,
+    body_masses_t: Optional[torch.Tensor] = None,
+    joint_body_indices: Optional[torch.Tensor] = None,
+    parent_body_indices: Optional[torch.Tensor] = None,
+    kp: Optional[torch.Tensor] = None,
+    kd: Optional[torch.Tensor] = None,
+    effort_limit: Optional[torch.Tensor] = None,
+    dof_limits_lower: Optional[torch.Tensor] = None,
+    dof_limits_upper: Optional[torch.Tensor] = None,
+    body_com_offset: Optional[torch.Tensor] = None,
+    w_last: bool = True,
+    torque_scale: float = 0.01,
+    momentum_scale: float = 0.1,
+    mass_scale: float = 0.05,
+    inertia_scale: float = 0.5,
+) -> torch.Tensor:
+    """Top-level picklable compute kernel for `minibrain_features_obs_factory`."""
+    from protomotions.envs.obs.joint_load_obs import compute_minibrain_joint_features
+
+    q_des = future_dof_pos[:, 0] if future_dof_pos.dim() == 3 else future_dof_pos
+    dq_des = future_dof_vel[:, 0] if future_dof_vel.dim() == 3 else future_dof_vel
+    feats_3d = compute_minibrain_joint_features(
+        dof_pos=dof_pos,
+        dof_vel=dof_vel,
+        q_des=q_des,
+        dq_des=dq_des,
+        body_pos=body_pos,
+        body_rot=body_rot,
+        body_vel=body_vel,
+        body_ang_vel=body_ang_vel,
+        subtree_mask=subtree_mask,
+        body_masses=body_masses_t,
+        joint_body_indices=joint_body_indices,
+        parent_body_indices=parent_body_indices,
+        kp=kp,
+        kd=kd,
+        effort_limit=effort_limit,
+        dof_limits_lower=dof_limits_lower,
+        dof_limits_upper=dof_limits_upper,
+        body_com_offset=body_com_offset,
+        body_stamina=body_stamina,
+        w_last=w_last,
+        torque_scale=torque_scale,
+        momentum_scale=momentum_scale,
+        mass_scale=mass_scale,
+        inertia_scale=inertia_scale,
+    )
+    return feats_3d.reshape(dof_pos.shape[0], -1)
+
+
+def minibrain_features_obs_factory(
+    robot_cfg: Any,
+    use_noisy: bool = False,
+    body_masses: Optional[torch.Tensor] = None,
+    torque_scale: float = 0.01,
+    momentum_scale: float = 0.1,
+    mass_scale: float = 0.05,
+    inertia_scale: float = 0.5,
+) -> MdpComponent:
+    """Factory for the `[num_envs, num_joints, 34]` per-joint Mini-Brain feature tensor.
+
+    Binds current state, next-step reference target (`EnvContext.mimic.future_dof_pos[:, 0]`),
+    per-body stamina (`EnvContext.body_stamina`), and static SMPL subtree topology.
+    """
+    from protomotions.envs.obs.joint_load_obs import build_subtree_topology
+
+    topology = build_subtree_topology(robot_cfg, body_masses=body_masses)
+    state = EnvContext.noisy if use_noisy else EnvContext.current
+
+    return MdpComponent(
+        compute_func=_compute_minibrain_features_from_mimic_context,
+        dynamic_vars={
+            "dof_pos": state.dof_pos,
+            "dof_vel": state.dof_vel,
+            "future_dof_pos": EnvContext.mimic.future_dof_pos,
+            "future_dof_vel": EnvContext.mimic.future_dof_vel,
+            "body_pos": state.rigid_body_pos,
+            "body_rot": state.rigid_body_rot,
+            "body_vel": state.rigid_body_vel,
+            "body_ang_vel": state.rigid_body_ang_vel,
+            "body_stamina": EnvContext.body_stamina,
+        },
+        static_params={
+            "subtree_mask": topology.subtree_mask,
+            "body_masses_t": topology.body_masses,
+            "joint_body_indices": topology.joint_body_indices,
+            "parent_body_indices": topology.parent_body_indices,
+            "kp": topology.kp,
+            "kd": topology.kd,
+            "effort_limit": topology.effort_limit,
+            "dof_limits_lower": topology.dof_limits_lower,
+            "dof_limits_upper": topology.dof_limits_upper,
+            "body_com_offset": topology.body_com_offset,
+            "w_last": True,
+            "torque_scale": torque_scale,
+            "momentum_scale": momentum_scale,
+            "mass_scale": mass_scale,
+            "inertia_scale": inertia_scale,
+        },
+    )
+
+
 def reduced_coords_obs_factory(
     use_noisy: bool = False,
     root_height_obs: bool = False,
@@ -2108,6 +2265,8 @@ __all__ = [
     "path_following_reward_factory",
     "collision_primitives_obs_factory",
     "stamina_obs_factory",
+    "joint_load_obs_factory",
+    "minibrain_features_obs_factory",
     "dof_pos_rew_factory",
     "body_impact_penalty_rew_factory",
     "opponent_impact_rew_factory",

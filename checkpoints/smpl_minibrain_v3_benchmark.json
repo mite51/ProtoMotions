@@ -1,0 +1,185 @@
+{
+  "trainer_config": {
+    "mode": "hybrid",
+    "horizon": 4,
+    "num_envs": 512,
+    "num_iterations": 150,
+    "dt": 0.03333333333333333,
+    "substeps": 4,
+    "device": "cuda:0",
+    "seed": 42,
+    "pose_noise_std": 0.06,
+    "vel_noise_std": 0.2,
+    "root_tilt_max_rad": 0.35,
+    "stamina_min": 0.2,
+    "stamina_max": 1.0,
+    "lockout_prob": 0.2,
+    "lr_policy": 0.003,
+    "lr_dynamics": 0.005,
+    "dynamics_updates_per_iter": 3,
+    "policy_updates_per_iter": 2,
+    "vel_weight": 0.08,
+    "reg_weight": 0.005,
+    "warmstart_guidance_weight": 0.15,
+    "warmstart_iters": 20,
+    "surrogate_explore_std": 0.05,
+    "ppo_epochs": 4,
+    "ppo_clip_eps": 0.2,
+    "gamma": 0.95,
+    "gae_tau": 0.95,
+    "pos_sharpness": 12.0,
+    "vel_sharpness": 0.5,
+    "ppo_action_reg": 0.01,
+    "ppo_init_std": 0.12,
+    "ppo_value_coef": 0.5,
+    "ppo_entropy_coef": 0.001,
+    "hybrid_surrogate_weight": 1.0,
+    "hybrid_ppo_weight": 0.5,
+    "edge_cases_file": "results/smpl_hierarchical_v2_subset64/edge_cases/edge_cases_level2_minibrain.pt",
+    "edge_case_prob": 0.35,
+    "motion_file": "/home/jwylie/Dev/ProtomotionsAnimData/amass_smpl_subset64.pt",
+    "synthetic_physics": true,
+    "checkpoint_path": "checkpoints/smpl_minibrain.pt",
+    "benchmark_json_path": "checkpoints/smpl_minibrain_v3_benchmark.json",
+    "eval_num_envs": 64
+  },
+  "benchmark_results": {
+    "nominal": {
+      "Baseline PD (u = q_des)": {
+        "step1_pos_mse": 0.002401786856353283,
+        "step1_vel_mse": 0.43342891335487366,
+        "horizon_pos_mse": 0.001659572881180793,
+        "horizon_vel_mse": 0.2543863598257303
+      },
+      "Analytical PD Lead (compute_analytical_pd_lead_action)": {
+        "step1_pos_mse": 0.002253326354548335,
+        "step1_vel_mse": 0.23957957327365875,
+        "horizon_pos_mse": 0.0010841366238310002,
+        "horizon_vel_mse": 0.1348471762612462
+      },
+      "SharedJointMiniBrain": {
+        "step1_pos_mse": 0.0022671930491924286,
+        "step1_vel_mse": 0.23548413813114166,
+        "horizon_pos_mse": 0.001103361566492822,
+        "horizon_vel_mse": 0.13318981416523457
+      }
+    },
+    "high_gravity_tilt": {
+      "Baseline PD (u = q_des)": {
+        "step1_pos_mse": 0.002405191771686077,
+        "step1_vel_mse": 0.4566752016544342,
+        "horizon_pos_mse": 0.001590102503541857,
+        "horizon_vel_mse": 0.26555638387799263
+      },
+      "Analytical PD Lead (compute_analytical_pd_lead_action)": {
+        "step1_pos_mse": 0.00229246960952878,
+        "step1_vel_mse": 0.2564011812210083,
+        "horizon_pos_mse": 0.0011070673208450899,
+        "horizon_vel_mse": 0.14205081388354301
+      },
+      "SharedJointMiniBrain": {
+        "step1_pos_mse": 0.002306445501744747,
+        "step1_vel_mse": 0.2522737681865692,
+        "horizon_pos_mse": 0.0011253805132582784,
+        "horizon_vel_mse": 0.14003213588148355
+      }
+    },
+    "low_stamina": {
+      "Baseline PD (u = q_des)": {
+        "step1_pos_mse": 0.002941589104011655,
+        "step1_vel_mse": 0.4194651246070862,
+        "horizon_pos_mse": 0.0021289165888447315,
+        "horizon_vel_mse": 0.3182895965874195
+      },
+      "Analytical PD Lead (compute_analytical_pd_lead_action)": {
+        "step1_pos_mse": 0.003100836183875799,
+        "step1_vel_mse": 0.5854178071022034,
+        "horizon_pos_mse": 0.001807542284950614,
+        "horizon_vel_mse": 0.2697507757693529
+      },
+      "SharedJointMiniBrain": {
+        "step1_pos_mse": 0.0028503581415861845,
+        "step1_vel_mse": 0.22931236028671265,
+        "horizon_pos_mse": 0.001564451158628799,
+        "horizon_vel_mse": 0.16520371846854687
+      }
+    },
+    "locked_1_or_2_dofs": {
+      "Baseline PD (u = q_des)": {
+        "step1_pos_mse": 0.002474274253472686,
+        "step1_vel_mse": 0.39362645149230957,
+        "horizon_pos_mse": 0.001658585504628718,
+        "horizon_vel_mse": 0.24976391717791557
+      },
+      "Analytical PD Lead (compute_analytical_pd_lead_action)": {
+        "step1_pos_mse": 0.0023577602114528418,
+        "step1_vel_mse": 0.24487614631652832,
+        "horizon_pos_mse": 0.0011144865275127813,
+        "horizon_vel_mse": 0.13927533198148012
+      },
+      "SharedJointMiniBrain": {
+        "step1_pos_mse": 0.0023690618108958006,
+        "step1_vel_mse": 0.24242883920669556,
+        "horizon_pos_mse": 0.0011367808183422312,
+        "horizon_vel_mse": 0.13768626656383276
+      }
+    }
+  },
+  "training_history_tail": [
+    {
+      "iteration": 145.0,
+      "dynamics_loss": 0.0014885383425280452,
+      "tracking_loss": 0.00038874108577147126,
+      "pred_pos_mse": 0.00399800855666399,
+      "pred_vel_mse": 0.3767448663711548,
+      "ppo_policy_loss": -0.0005237567238509655,
+      "ppo_value_loss": 0.39494308829307556,
+      "ppo_entropy": -4.25192403793335,
+      "mean_joint_reward": 1.109610676765442
+    },
+    {
+      "iteration": 146.0,
+      "dynamics_loss": 0.0011268381495028734,
+      "tracking_loss": 0.0003048662911169231,
+      "pred_pos_mse": 0.0030371961183845997,
+      "pred_vel_mse": 0.2972336709499359,
+      "ppo_policy_loss": -2.3556955056847073e-05,
+      "ppo_value_loss": 0.34935444593429565,
+      "ppo_entropy": -4.2431864738464355,
+      "mean_joint_reward": 1.1184161901474
+    },
+    {
+      "iteration": 147.0,
+      "dynamics_loss": 0.0013827593065798283,
+      "tracking_loss": 0.00037099808105267584,
+      "pred_pos_mse": 0.003725789487361908,
+      "pred_vel_mse": 0.3552931249141693,
+      "ppo_policy_loss": 0.0012689633294939995,
+      "ppo_value_loss": 0.3781377673149109,
+      "ppo_entropy": -4.265872478485107,
+      "mean_joint_reward": 1.1051347255706787
+    },
+    {
+      "iteration": 148.0,
+      "dynamics_loss": 0.0011728154495358467,
+      "tracking_loss": 0.00036066147731617093,
+      "pred_pos_mse": 0.0035354492720216513,
+      "pred_vel_mse": 0.353708952665329,
+      "ppo_policy_loss": -0.0011665364727377892,
+      "ppo_value_loss": 0.3443005681037903,
+      "ppo_entropy": -4.244358062744141,
+      "mean_joint_reward": 1.1079795360565186
+    },
+    {
+      "iteration": 149.0,
+      "dynamics_loss": 0.001162308850325644,
+      "tracking_loss": 0.0003190250718034804,
+      "pred_pos_mse": 0.003128217766061425,
+      "pred_vel_mse": 0.3115576505661011,
+      "ppo_policy_loss": 0.0005682117189280689,
+      "ppo_value_loss": 0.36042550206184387,
+      "ppo_entropy": -4.213593006134033,
+      "mean_joint_reward": 1.1177036762237549
+    }
+  ]
+}
