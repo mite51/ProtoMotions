@@ -3,7 +3,7 @@
     "mode": "hybrid",
     "horizon": 4,
     "num_envs": 512,
-    "num_iterations": 150,
+    "num_iterations": 120,
     "dt": 0.03333333333333333,
     "substeps": 4,
     "device": "cuda:0",
@@ -37,149 +37,149 @@
     "hybrid_ppo_weight": 0.5,
     "edge_cases_file": null,
     "edge_case_prob": 0.3,
-    "motion_file": "/home/jwylie/Dev/ProtomotionsAnimData/amass_smpl_subset64.pt",
+    "motion_file": "/home/jwylie/Dev/ProtomotionsAnimData/melee_combat_bundle.pt",
     "synthetic_physics": true,
-    "checkpoint_path": "checkpoints/smpl_minibrain.pt",
+    "checkpoint_path": "checkpoints/smpl_minibrain_melee_v3.pt",
     "benchmark_json_path": "checkpoints/smpl_minibrain_benchmark.json",
     "eval_num_envs": 64
   },
   "benchmark_results": {
     "nominal": {
       "Baseline PD (u = q_des)": {
-        "step1_pos_mse": 0.0023916945792734623,
-        "step1_vel_mse": 0.43541496992111206,
-        "horizon_pos_mse": 0.0016528006817679852,
-        "horizon_vel_mse": 0.25390464067459106
+        "step1_pos_mse": 0.0026366664096713066,
+        "step1_vel_mse": 0.9255294799804688,
+        "horizon_pos_mse": 0.002816281747072935,
+        "horizon_vel_mse": 0.9861296862363815
       },
       "Analytical PD Lead (compute_analytical_pd_lead_action)": {
-        "step1_pos_mse": 0.002240030560642481,
-        "step1_vel_mse": 0.24192768335342407,
-        "horizon_pos_mse": 0.0010774242400657386,
-        "horizon_vel_mse": 0.13458621688187122
+        "step1_pos_mse": 0.002539406530559063,
+        "step1_vel_mse": 0.28328949213027954,
+        "horizon_pos_mse": 0.0017691874236334115,
+        "horizon_vel_mse": 0.1970334555953741
       },
       "SharedJointMiniBrain": {
-        "step1_pos_mse": 0.0022449723910540342,
-        "step1_vel_mse": 0.24116577208042145,
-        "horizon_pos_mse": 0.001089463876269292,
-        "horizon_vel_mse": 0.13426384143531322
+        "step1_pos_mse": 0.0025372665841132402,
+        "step1_vel_mse": 0.28728336095809937,
+        "horizon_pos_mse": 0.0017568669863976538,
+        "horizon_vel_mse": 0.21356197074055672
       }
     },
     "high_gravity_tilt": {
       "Baseline PD (u = q_des)": {
-        "step1_pos_mse": 0.0023914023768156767,
-        "step1_vel_mse": 0.4572514593601227,
-        "horizon_pos_mse": 0.0015658737102057785,
-        "horizon_vel_mse": 0.263788353651762
+        "step1_pos_mse": 0.0027201909106224775,
+        "step1_vel_mse": 1.1096993684768677,
+        "horizon_pos_mse": 0.002833155624102801,
+        "horizon_vel_mse": 0.979730635881424
       },
       "Analytical PD Lead (compute_analytical_pd_lead_action)": {
-        "step1_pos_mse": 0.0022792203817516565,
-        "step1_vel_mse": 0.258806437253952,
-        "horizon_pos_mse": 0.0010990046939696185,
-        "horizon_vel_mse": 0.14185562077909708
+        "step1_pos_mse": 0.002683863276615739,
+        "step1_vel_mse": 0.30639660358428955,
+        "horizon_pos_mse": 0.0017401372024323791,
+        "horizon_vel_mse": 0.200284231454134
       },
       "SharedJointMiniBrain": {
-        "step1_pos_mse": 0.0022839908488094807,
-        "step1_vel_mse": 0.2582620084285736,
-        "horizon_pos_mse": 0.0011093391658505425,
-        "horizon_vel_mse": 0.14121071249246597
+        "step1_pos_mse": 0.0026872451417148113,
+        "step1_vel_mse": 0.3090848922729492,
+        "horizon_pos_mse": 0.0017374854360241443,
+        "horizon_vel_mse": 0.21347708441317081
       }
     },
     "low_stamina": {
       "Baseline PD (u = q_des)": {
-        "step1_pos_mse": 0.0029315168503671885,
-        "step1_vel_mse": 0.41880714893341064,
-        "horizon_pos_mse": 0.002093225921271369,
-        "horizon_vel_mse": 0.31325558200478554
+        "step1_pos_mse": 0.002970045432448387,
+        "step1_vel_mse": 0.8873821496963501,
+        "horizon_pos_mse": 0.003514726529829204,
+        "horizon_vel_mse": 1.2076724469661713
       },
       "Analytical PD Lead (compute_analytical_pd_lead_action)": {
-        "step1_pos_mse": 0.0030896663665771484,
-        "step1_vel_mse": 0.5857681035995483,
-        "horizon_pos_mse": 0.0017822329537011683,
-        "horizon_vel_mse": 0.2668425515294075
+        "step1_pos_mse": 0.0029531640466302633,
+        "step1_vel_mse": 0.31447863578796387,
+        "horizon_pos_mse": 0.0019377253483980894,
+        "horizon_vel_mse": 0.3533119857311249
       },
       "SharedJointMiniBrain": {
-        "step1_pos_mse": 0.002831125631928444,
-        "step1_vel_mse": 0.23279273509979248,
-        "horizon_pos_mse": 0.0015395133959827945,
-        "horizon_vel_mse": 0.16584679670631886
+        "step1_pos_mse": 0.0029540173709392548,
+        "step1_vel_mse": 0.3162631094455719,
+        "horizon_pos_mse": 0.0019005948270205408,
+        "horizon_vel_mse": 0.36866582185029984
       }
     },
     "locked_1_or_2_dofs": {
       "Baseline PD (u = q_des)": {
-        "step1_pos_mse": 0.002466064179316163,
-        "step1_vel_mse": 0.3945029377937317,
-        "horizon_pos_mse": 0.0016524698585271835,
-        "horizon_vel_mse": 0.24849633872509003
+        "step1_pos_mse": 0.002741055330261588,
+        "step1_vel_mse": 0.9598642587661743,
+        "horizon_pos_mse": 0.002928944886662066,
+        "horizon_vel_mse": 1.1427554190158844
       },
       "Analytical PD Lead (compute_analytical_pd_lead_action)": {
-        "step1_pos_mse": 0.002344266977161169,
-        "step1_vel_mse": 0.24733179807662964,
-        "horizon_pos_mse": 0.001107226315070875,
-        "horizon_vel_mse": 0.13897372502833605
+        "step1_pos_mse": 0.002636713208630681,
+        "step1_vel_mse": 0.2920624613761902,
+        "horizon_pos_mse": 0.0018390446493867785,
+        "horizon_vel_mse": 0.22628872469067574
       },
       "SharedJointMiniBrain": {
-        "step1_pos_mse": 0.002348734298720956,
-        "step1_vel_mse": 0.24668771028518677,
-        "horizon_pos_mse": 0.0011197262283531018,
-        "horizon_vel_mse": 0.13865889608860016
+        "step1_pos_mse": 0.002624241169542074,
+        "step1_vel_mse": 0.299517959356308,
+        "horizon_pos_mse": 0.0017866606649477035,
+        "horizon_vel_mse": 0.2583318166434765
       }
     }
   },
   "training_history_tail": [
     {
-      "iteration": 145.0,
-      "dynamics_loss": 0.0008933934732340276,
-      "tracking_loss": 0.0001483846572227776,
-      "pred_pos_mse": 0.0014377558836713433,
-      "pred_vel_mse": 0.1479244828224182,
-      "ppo_policy_loss": 2.2269057808443904e-05,
-      "ppo_value_loss": 0.3283565938472748,
-      "ppo_entropy": -4.374885559082031,
-      "mean_joint_reward": 1.174878478050232
+      "iteration": 115.0,
+      "dynamics_loss": 0.0010713638039305806,
+      "tracking_loss": 0.00031468283850699663,
+      "pred_pos_mse": 0.002035274403169751,
+      "pred_vel_mse": 0.27702054381370544,
+      "ppo_policy_loss": 0.00015999199240468442,
+      "ppo_value_loss": 0.5129730701446533,
+      "ppo_entropy": -3.8905129432678223,
+      "mean_joint_reward": 1.1348960399627686
     },
     {
-      "iteration": 146.0,
-      "dynamics_loss": 0.0007489898707717657,
-      "tracking_loss": 0.0001500301150372252,
-      "pred_pos_mse": 0.0014198212884366512,
-      "pred_vel_mse": 0.1452430933713913,
-      "ppo_policy_loss": 0.0002294319710927084,
-      "ppo_value_loss": 0.3305794298648834,
-      "ppo_entropy": -4.359834671020508,
-      "mean_joint_reward": 1.1755045652389526
+      "iteration": 116.0,
+      "dynamics_loss": 0.0013782131718471646,
+      "tracking_loss": 0.00035652279620990157,
+      "pred_pos_mse": 0.002176018198952079,
+      "pred_vel_mse": 0.3059806227684021,
+      "ppo_policy_loss": 0.00021536066196858883,
+      "ppo_value_loss": 0.550421953201294,
+      "ppo_entropy": -3.871591329574585,
+      "mean_joint_reward": 1.129550576210022
     },
     {
-      "iteration": 147.0,
-      "dynamics_loss": 0.0006164317019283772,
-      "tracking_loss": 0.00015461121802218258,
-      "pred_pos_mse": 0.0014507003361359239,
-      "pred_vel_mse": 0.15009023249149323,
-      "ppo_policy_loss": 0.00012918270658701658,
-      "ppo_value_loss": 0.34153077006340027,
-      "ppo_entropy": -4.354780197143555,
-      "mean_joint_reward": 1.1735166311264038
+      "iteration": 117.0,
+      "dynamics_loss": 0.0012318618828430772,
+      "tracking_loss": 0.0003220065264031291,
+      "pred_pos_mse": 0.0020404551178216934,
+      "pred_vel_mse": 0.2850770056247711,
+      "ppo_policy_loss": 0.00025183919933624566,
+      "ppo_value_loss": 0.5006428956985474,
+      "ppo_entropy": -3.850977659225464,
+      "mean_joint_reward": 1.1352356672286987
     },
     {
-      "iteration": 148.0,
-      "dynamics_loss": 0.0010427429806441069,
-      "tracking_loss": 0.0001590050960658118,
-      "pred_pos_mse": 0.0014291071565821767,
-      "pred_vel_mse": 0.14872652292251587,
-      "ppo_policy_loss": 0.0001725063775666058,
-      "ppo_value_loss": 0.3717009127140045,
-      "ppo_entropy": -4.373340129852295,
-      "mean_joint_reward": 1.1742435693740845
+      "iteration": 118.0,
+      "dynamics_loss": 0.0010948661947622895,
+      "tracking_loss": 0.000319444399792701,
+      "pred_pos_mse": 0.002000810345634818,
+      "pred_vel_mse": 0.2823934555053711,
+      "ppo_policy_loss": 0.00010847235535038635,
+      "ppo_value_loss": 0.521068811416626,
+      "ppo_entropy": -3.8497865200042725,
+      "mean_joint_reward": 1.1343846321105957
     },
     {
-      "iteration": 149.0,
-      "dynamics_loss": 0.0010154814226552844,
-      "tracking_loss": 0.0001672902435529977,
-      "pred_pos_mse": 0.0014691008254885674,
-      "pred_vel_mse": 0.1609247475862503,
-      "ppo_policy_loss": 0.00040760767296887934,
-      "ppo_value_loss": 0.34148484468460083,
-      "ppo_entropy": -4.356987476348877,
-      "mean_joint_reward": 1.172609806060791
+      "iteration": 119.0,
+      "dynamics_loss": 0.0012720689410343766,
+      "tracking_loss": 0.0003148621181026101,
+      "pred_pos_mse": 0.001999953994527459,
+      "pred_vel_mse": 0.2794748544692993,
+      "ppo_policy_loss": 0.0003823428996838629,
+      "ppo_value_loss": 0.5202163457870483,
+      "ppo_entropy": -3.8284852504730225,
+      "mean_joint_reward": 1.135185718536377
     }
   ]
 }

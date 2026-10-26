@@ -441,6 +441,8 @@ class BaseEvaluator:
         num_motions: int,
         motion_num_frames: torch.Tensor,
         max_eval_steps: int,
+        keys_filter: Optional[list] = None,
+        metrics_device: Optional[torch.device] = None,
     ) -> None:
         """
         Add metrics for raw robot state (dof_pos, rigid_body_pos, etc.).
@@ -451,11 +453,14 @@ class BaseEvaluator:
             num_motions: Number of motions to evaluate
             motion_num_frames: Number of frames per motion
             max_eval_steps: Maximum evaluation steps
+            keys_filter: Optional list of keys to allocate (defaults to all)
+            metrics_device: Optional device override for MotionMetrics storage
         """
         # Default implementation for humanoid robot state
         if not hasattr(self.env, "simulator"):
             return
 
+        target_device = metrics_device if metrics_device is not None else self.device
         try:
             from protomotions.simulator.base_simulator.simulator_state import RobotState
 
@@ -463,12 +468,14 @@ class BaseEvaluator:
             shape_mapping = dummy_state.get_shape_mapping(flattened=True)
 
             for k, shape in shape_mapping.items():
+                if keys_filter is not None and k not in keys_filter:
+                    continue
                 metrics[k] = MotionMetrics(
                     num_motions,
                     motion_num_frames,
                     max_eval_steps,
                     num_sub_features=shape[0],
-                    device=self.device,
+                    device=target_device,
                 )
         except (AttributeError, KeyError, IndexError) as e:
             log.warning("Could not add robot state metrics: %s", e)

@@ -38,7 +38,11 @@ class MotionMetrics:
         self.num_sub_features = num_sub_features
         self.device = device
         self.dtype = dtype
-        self.motion_lens = motion_lens
+        self.motion_lens = (
+            motion_lens.to(device)
+            if isinstance(motion_lens, torch.Tensor) and device is not None
+            else motion_lens
+        )
         self.max_motion_len = max_motion_len
 
         # Raw data storage
@@ -68,6 +72,13 @@ class MotionMetrics:
         """
         if values.ndim == 1:
             values = values.unsqueeze(1)
+        if self.device is not None:
+            if motion_ids.device != self.device:
+                motion_ids = motion_ids.to(self.device)
+            if values.device != self.device or values.dtype != self.dtype:
+                values = values.to(device=self.device, dtype=self.dtype)
+            if frame_indices is not None and frame_indices.device != self.device:
+                frame_indices = frame_indices.to(self.device)
         assert motion_ids.shape[0] == values.shape[0]
 
         # assert motion_ids being non-duplicated

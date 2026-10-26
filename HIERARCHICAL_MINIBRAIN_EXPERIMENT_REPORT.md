@@ -161,22 +161,86 @@ All four models were trained from scratch for **200,000,000 steps (`1,525` epoch
    - **Why `Hierarchical v1` lagged in late training (`90.62%`):** In `v1`, `HierarchicalPPOActor` emitted raw radians $u_{\text{pd}} \in [-\pi, \pi]$ directly as `mean_action` while leaving PPO's `bounds_loss(|\mu| > 1.0)` active. Consequently, `v1` incurred a quadratic `bounds_loss` penalty whenever any joint angle exceeded $1.0\text{ rad}$ ($57.3^\circ$). Even with that bug, `v1` still achieved **`3.9x` longer early survival** (`22.54` vs. `5.71` frames) and **lower global rotation error** (`11.68°` vs. `14.40°`) than the flat baseline because the policy starts at $q_{\text{des}} = q_{\text{ref}}$ with Mini-Brain gravity/velocity compensation.
    - **Why `Hierarchical v2/v3` use `convert_to_normalized_action_space=True` + `action_transform="clamp"`:** Dividing the Mini-Brain's radian output $u_{\text{pd}}$ by $\text{scale} = \pi$ puts `Hierarchical v2/v3` on the same $[-1, 1]$ `bounds_loss` scale as the flat baseline. Pairing this with `action_transform="clamp"` (instead of `"tanh"`) ensures the environment reconstructs $\pi \cdot \text{clamp}(u_{\text{pd}}/\pi, -1, 1) = u_{\text{pd}}$ exactly, without nonlinear $\tanh$ compression distorting the Mini-Brain's analytical/learned PD target. *(Note: in the flat `mlp.py` baseline, `bounds_loss(|\mu| > 1.0)` combined with $\tanh(1.0) \approx 0.762$ also softly penalizes the flat policy above $76.2\%$ of the joint range, so switching `mlp.py` from `"tanh"` to `"clamp"` is a worthwhile independent ablation on high-flexion clips.)*
    - **Isolating the Exact CoM Lever Arm Fix (`v2 -> v3`):** Both `v2` and `v3` share the exact same normalized action space, `clamp` transform, and hyperparameters; the *only* difference in `v3` is adding `body_com_offset = mj_model.body_ipos[1:]` (`joint_load_obs.py:130–248`), which boosted Epoch 400 (`52.4M` steps) success rate from `57.81%` $\to$ **`60.94%`**, Epoch 800 (`104.9M` steps) success rate from `79.69%` $\to$ **`82.81%`**, and Epoch 1400 global rotation error to **`7.02°`**.
+5. **`10x–14x` Estimated Training & Compute Savings at Full `9,725`-Clip Scale:**
+   On the full `9,725`-motion corpus (`AMASS` + `MeleeCombatBundle`, `31.33 hours` of motion), **Hierarchical v3** matches the shipped **`9.72B`-step Pretrained SMPL Tracker's** global rotation accuracy (`8.10°`) by **Epoch 4200 (`0.55B` steps, `~4.2 hours` on a single RTX 5090 — `17.7x` fewer steps)**, surpasses its overall clip completion rate (`97.28%`) by **Epoch 5200 (`0.68B` steps, `~5.2 hours` — `14.3x` fewer steps / `93%` compute reduction)**, and reaches **`98.38%` (`9,567 / 9,725` clips) with `6.26°` rotation error** by **Epoch 7000 (`0.92B` steps, `~7.0 hours` — `10.6x` fewer steps)**.
 
 ---
 
-## 5. Reproducing Evaluation & Live Side-by-Side Comparison
+## 5. Full-Scale Corpus Benchmark (`9,725` Motions: `AMASS` + `MeleeCombatBundle`) vs. Shipped `9.72B`-Step Pretrained Model
+
+To test scalability beyond the 64-clip subset, we packaged all `9,324` clean AMASS training clips together with `401` new combat/locomotion clips from `MeleeCombatBundle` into `amass_smpl_with_melee_combat.pt` (`9,725` clips, `31.33 hours` / `4,146,885` frames) and trained **Hierarchical v3 (`smpl_hierarchical_v3_all_melee`)** from scratch to **Epoch 7000 (`917.5M` steps = `0.92B` steps)**.
+
+We compared `results/smpl_hierarchical_v3_all_melee/score_based.ckpt` (`0.92B` steps) head-to-head against the shipped **Pretrained SMPL Motion Tracker** (`data/pretrained_models/motion_tracker/smpl/last.ckpt`, trained for **Epoch 9270 / `9.72B` steps** — **`10.6x` more steps**):
+
+### 5.1 Head-to-Head on Full `9,725`-Clip Dataset (`amass_smpl_with_melee_combat.pt`)
+
+| Metric | Shipped Pretrained Model (`9.72B` Steps, Ep 9270) | **Hierarchical v3 (`0.92B` Steps, Ep 7000 `score_based.ckpt`)** | Delta / Comparison |
+| :--- | :---: | :---: | :---: |
+| **Environment Steps Trained** | `9,720,299,520` (`9.72B`) | **`917,504,000` (`0.92B`)** | **`10.6x` fewer steps** |
+| **Success Rate (`eval/success_rate`)** | `97.28%` (`9,460 / 9,725`, `265` failed) | **`98.38%` (`9,567 / 9,725`, `158` failed)** | **`+1.10%` (`107` fewer failed clips)** |
+| **Global Rotation Error (`gr_error/mean`)** | `0.1413 rad` (`8.10°`) | **`0.1093 rad` (`6.26°`)** | **`-22.6%` lower rotation error** |
+| **Global Position Error (`gt_error/mean`)** | `0.0467 m` (`4.67 cm`) | `0.0501 m` (`5.01 cm`) | `+0.34 cm` |
+| **Max Joint Error (`max_joint_error/mean`)** | `0.0853 rad` (`4.89°`) | `0.0928 rad` (`5.32°`) | `+0.43°` |
+
+### 5.2 Head-to-Head Specifically on the `401` `MeleeCombatBundle` Clips (`melee_combat_bundle.pt`)
+
+| Metric | Shipped Pretrained Model (`9.72B` Steps, Ep 9270) | **Hierarchical v3 (`0.92B` Steps, Ep 7000 `score_based.ckpt`)** | Delta / Comparison |
+| :--- | :---: | :---: | :---: |
+| **Success Rate (`eval/success_rate`)** | `96.76%` (`388 / 401`, `13` failed) | **`97.76%` (`392 / 401`, `9` failed)** | **`+1.00%` (`31%` fewer failed clips)** |
+| **Global Rotation Error (`gr_error/mean`)** | `0.2470 rad` (`14.15°`) | **`0.1378 rad` (`7.89°`)** | **`-44.2%` lower rotation error** |
+| **Global Position Error (`gt_error/mean`)** | `0.0639 m` (`6.39 cm`) | `0.0664 m` (`6.64 cm`) | `+0.25 cm` |
+| **Global Position Max Error (`gt_error/max`)** | `4.0044 m` | **`3.9922 m`** | `-0.012 m` |
+| **Max Joint Error (`max_joint_error/mean`)** | `0.1180 rad` (`6.76°`) | `0.1283 rad` (`7.35°`) | `+0.59°` |
+| **Normalized Jerk (`normalized_jerk_mean`)** | `1571.5` | **`1562.3`** | **Lower jerk (smoother)** |
+| **High-Jerk Frames (`high_jerk_frame_%`)** | `32.62%` | **`27.48%`** | **`-5.14%` fewer high-jerk frames** |
+| **Action Max Delta (`action_delta_max_deg`)** | `7.469°` | **`7.052°`** | **`-0.42°` smaller max step delta** |
+
+---
+
+### 5.3 Estimated Training Savings & Crossover Analysis (`10x–14x` Reduction in Steps & Compute)
+
+Tracking the evaluation curve of `smpl_hierarchical_v3_all_melee` (`131,072` environment steps per epoch at `4,096` envs, running at `~1,000` epochs/hour on a single RTX 5090) against the shipped **`9.72B`-step (`9,720,299,520` steps) Pretrained SMPL Tracker** (`97.28%` success rate, `0.1413 rad` / `8.10°` rotation error on the `9,725`-clip corpus) establishes three concrete crossover points:
+
+| Milestone on `9,725`-Clip Corpus | `Hierarchical v3` Epoch & Steps | Single-GPU Wall-Clock Time (RTX 5090) | Step Reduction vs. `9.72B`-Step Pretrained Model |
+| :--- | :---: | :---: | :---: |
+| **Match Global Rotation Error (`\le 0.1413 rad` / `8.10°`)** | **Epoch 4200 (`0.55B` steps)** (`gr_error = 0.1366 rad`, `SR = 96.11%`) | **`~4.2 hours`** | **`17.7x` fewer steps (`94.3%` savings)** |
+| **Match / Exceed Overall Success Rate (`\ge 97.28%`)** | **Epoch 5200 (`0.68B` steps)** (`SR = 97.47%`, `gr_error = 0.1201 rad`) | **`~5.2 hours`** | **`14.3x` fewer steps (`93.0%` savings)** |
+| **Epoch 7000 Checkpoint (`score_based.ckpt`)** | **Epoch 7000 (`0.92B` steps)** (`SR = 98.38%`, `gr_error = 0.1093 rad`) | **`~7.0 hours`** | **`10.6x` fewer steps (`90.6%` savings)** |
+
+---
+
+## 6. Critical Assessment: Ideal Simulation vs. Sim-to-Real & Per-Joint Calibration
+
+### 6.1 What Drives the Gain in Ideal Simulation?
+In an idealized simulator (`PhysX`), every joint actuator obeys an exact, time-invariant linear PD law:
+$$\tau = k_p (u_{\text{pd}} - q) - k_d \dot{q}$$
+with zero communication latency, zero static/Coulomb friction, no backlash, no thermal derating, and no torque-speed saturation curve. Under these ideal conditions:
+- The **closed-form analytical PD lead & exact-CoM gravity compensation** (`compute_analytical_pd_lead_action` in `joint_load_obs.py`) coupled with **reference-relative residual actions ($q_{\text{des}} = q_{\text{ref}} + \Delta q$)** accounts for **~90%+ of the local tracking improvement**.
+- In our 4-regime offline benchmark (`scripts/train_smpl_minibrain.py`), analytical PD lead alone reduced 4-step velocity MSE by **80%** (`0.986 -> 0.197`) and position MSE by **37%** (`0.00282 -> 0.00177`), while the neural `SharedJointMiniBrain` residual added a further **~1–2%** position MSE reduction on top of the analytical formula because ideal linear PD leaves almost no unmodeled local actuator nonlinearity to learn.
+
+### 6.2 Why the Neural Mini-Brain Architecture Matters for Non-Ideal Actuators & Sim-to-Real
+Analytical inverse formulas only hold under ideal conditions. On physical hardware (or in high-fidelity sim-to-real transfer), joints violate ideal linear PD in ways closed-form equations cannot invert:
+1. **Per-Joint Hardware Asymmetry & Wear:** Real actuators exhibit joint-specific gear friction, harmonic-drive compliance, motor heating, and manufacturing tolerances (e.g., a left knee actuator behaving differently from a right knee or ankle).
+2. **Nonlinear Actuator Dynamics:** Real quasi-direct-drive (QDD) and series-elastic actuators exhibit stiction deadzones near $\dot{q} = 0$, nonlinear torque-speed saturation curves (back-EMF limits), and 2–10 ms bus/filtering phase lag.
+3. **Decoupled Per-Joint Calibration Without Retraining the Main Brain:**
+   - In a flat end-to-end policy (`mlp.py`), whole-body balance and actuator characteristics are entangled across all 69 outputs; if one joint's physical behavior changes, the entire whole-body policy must be fine-tuned in full simulation.
+   - With the **Main Brain + Mini-Brain ("Spinal Cord") split**, the Main Brain outputs physical desired kinematics ($q_{\text{des}}, \dot{q}_{\text{des}}$), while the Mini-Brain maps $(q_{j,\text{des}}, \dot{q}_{j,\text{des}}, \text{load}_j) \to u_{j,\text{motor}}$. Individual joints can be calibrated or fine-tuned from short real-world or bench trajectories (e.g., via per-joint calibration embeddings or per-joint residual adapters in `SharedJointMiniBrain`) in **seconds**, while keeping the whole-body Main Brain completely frozen.
+
+---
+
+## 7. Reproducing Evaluation & Live Side-by-Side Comparison
 
 ```bash
 # Run all 29 unit tests (including exact RNE gravity torque verification)
 PYTHONPATH=. conda run -n protomotion_isaaclab_12 pytest tests/ -v
 
-# Live side-by-side viewport comparison:
-# Env 0 (/World/envs/env_0/Robot, Left)  = Flat MLP Baseline
-# Env 1 (/World/envs/env_1/Robot, Right) = Hierarchical v3 (score_based.ckpt)
+# Live side-by-side viewport comparison on MeleeCombatBundle (401 clips):
+# Env 0 (/World/envs/env_0/Robot, Left)  = Shipped 9.72B-step Pretrained Model
+# Env 1 (/World/envs/env_1/Robot, Right) = Hierarchical v3 (0.92B steps, score_based.ckpt)
 PYTHONPATH=. conda run -n protomotion_isaaclab_12 python protomotions/inference_agent.py \
-  --checkpoint results/smpl_baseline_subset64/last.ckpt \
-  --compare-checkpoint results/smpl_hierarchical_v3_subset64/score_based.ckpt \
-  --motion-file /home/jwylie/Dev/ProtomotionsAnimData/amass_smpl_subset64.pt \
+  --checkpoint data/pretrained_models/motion_tracker/smpl/last.ckpt \
+  --compare-checkpoint results/smpl_hierarchical_v3_all_melee/score_based.ckpt \
+  --motion-file /home/jwylie/Dev/ProtomotionsAnimData/melee_combat_bundle.pt \
   --simulator isaaclab \
   --num-envs 1 \
   --pair-spacing 1.5

@@ -723,19 +723,51 @@ def run_side_by_side_comparison(
             m_ids = env.motion_manager.motion_ids[all_ids]
             m_times = env.motion_manager.motion_times[all_ids]
             new_states, new_obj_states = env.compute_ref_reset_state(
-                all_ids, m_ids, m_times, sample_flat=False
+                all_ids, m_ids, m_times, sample_flat=True
             )
+            ref_state = env.motion_lib.get_motion_state(m_ids, m_times)
+            from protomotions.simulator.base_simulator.simulator_state import ResetState
+
+            # Keep pairs anchored well inside the +X/+Y terrain interior (x=40.0, y=40.0 + pair_idx * stride)
+            # so neither robot walks off the (0, 0, 0) terrain corner and the camera always frames both.
+            if env.scene_lib.num_scenes() == 0:
+                ref_root_ev = env.motion_lib.get_motion_state(
+                    env.motion_manager.motion_ids[ev],
+                    env.motion_manager.motion_times[ev],
+                ).rigid_body_pos[:, 0, :]
+                stride_y = max(pair_spacing * 2.5, 4.0)
+                env.respawn_root_offset[ev, 0] = 40.0 - ref_root_ev[:, 0]
+                env.respawn_root_offset[ev, 1] = (
+                    40.0 + pair_ids.to(dtype=torch.float32) * stride_y - ref_root_ev[:, 1]
+                )
+
             # Place odd env (Policy B) right next to even env (Policy A) offset by +pair_spacing in Y
             env.respawn_root_offset[od, 0] = env.respawn_root_offset[ev, 0]
             env.respawn_root_offset[od, 1] = env.respawn_root_offset[ev, 1] + pair_spacing
             env.respawn_root_offset[od, 2] = env.respawn_root_offset[ev, 2]
 
-            ref_state = env.motion_lib.get_motion_state(m_ids, m_times)
-            from protomotions.simulator.base_simulator.simulator_state import ResetState
-
             new_states = ResetState.from_robot_state(ref_state).clone()
             new_states.root_pos += env.respawn_root_offset[all_ids]
             env.simulator.reset_envs(new_states, new_obj_states, all_ids)
+
+            # Reframe camera on Pair 0 whenever Pair 0 resets in GUI mode
+            if not getattr(env.simulator, "headless", True) and (pair_ids == 0).any():
+                import numpy as np
+
+                root_0 = new_states.root_pos[0].detach().cpu().numpy()
+                eye = root_0 + np.array([0.0, -5.0, 1.2])
+                target = root_0 + np.array([0.0, 0.5 * pair_spacing, 0.2])
+                if hasattr(env.simulator, "_cam_prev_char_pos"):
+                    env.simulator._cam_prev_char_pos = root_0.copy()
+                if hasattr(env.simulator, "_sim") and hasattr(
+                    env.simulator._sim, "set_camera_view"
+                ):
+                    env.simulator._sim.set_camera_view(eye.tolist(), target.tolist())
+                if hasattr(env.simulator, "_perspective_view"):
+                    try:
+                        env.simulator._perspective_view.set_camera_view(eye, target)
+                    except Exception:
+                        pass
 
             if env.state_history is not None:
                 mask_false = torch.zeros(

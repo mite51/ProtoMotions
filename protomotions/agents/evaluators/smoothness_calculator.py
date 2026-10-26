@@ -102,7 +102,7 @@ class SmoothnessCalculator:
                 continue
 
             # Extract valid frames for this motion: [T, num_bodies, 3]
-            pos_motion = pos[motion_idx, :valid_frames]
+            pos_motion = pos[motion_idx, :valid_frames].to(self.device)
 
             # Compute windowed normalized jerk efficiently using unfold
             window_nj = self._compute_windowed_normalized_jerk(

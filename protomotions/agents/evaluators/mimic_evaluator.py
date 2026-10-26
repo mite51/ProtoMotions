@@ -58,13 +58,36 @@ class MimicEvaluator(BaseEvaluator):
         """Create MotionMetrics buffers for trajectory collection (robot state + actions)."""
         metrics = {}
 
+        # Cap dense trajectory buffers at 512 motions on GPU (~173 MB VRAM) when
+        # evaluating multi-thousand-motion libraries: avoids 15 GB GPU OOM AND
+        # avoids thousands of synchronous GPU->CPU transfers during rollout.
+        # Full-dataset success_rate/gt_error/gr_error/motion_weights still cover
+        # 100% of num_motions via _component_value_sum / _motion_failed.
+        metrics_num_motions = min(num_motions, 512)
+        metrics_motion_num_frames = motion_num_frames[:metrics_num_motions]
+        need_full_motion_lib_export = (
+            self.config.save_predicted_motion_lib_every is not None
+            and self.eval_count % self.config.save_predicted_motion_lib_every == 0
+            and num_motions <= 512
+        )
+        keys_filter = None if need_full_motion_lib_export else ["rigid_body_pos"]
+
         self._add_robot_state_metrics(
-            metrics, num_motions, motion_num_frames, max_eval_steps
+            metrics,
+            metrics_num_motions,
+            metrics_motion_num_frames,
+            max_eval_steps,
+            keys_filter=keys_filter,
+            metrics_device=self.device,
         )
 
         num_dofs = self.env.robot_config.kinematic_info.num_dofs
         metrics["actions"] = MotionMetrics(
-            num_motions, motion_num_frames, max_eval_steps, num_dofs, device=self.device
+            metrics_num_motions,
+            metrics_motion_num_frames,
+            max_eval_steps,
+            num_dofs,
+            device=self.device,
         )
 
         return metrics
@@ -177,12 +200,28 @@ class MimicEvaluator(BaseEvaluator):
 
         self._on_episode_start(env_ids)
 
-        # Park envs that aren't part of this batch so they don't generate
-        # PhysX broadphase pairs / contacts during the eval. Pre-eval state is
-        # restored later in cleanup_after_evaluation via env.restore_state().
-        self._park_inactive_envs(env_ids)
+        # When scene objects exist, park inactive envs below terrain to avoid
+        # scene-object broadphase pair overflow. When no scene objects exist,
+        # reset all envs on the flat terrain so inactive envs don't free-fall
+        # to z = -2000m at -200 m/s during 600-step evaluation rollouts.
+        has_scenes = (
+            getattr(self.env, "scene_lib", None) is not None
+            and self.env.scene_lib.num_scenes() > 0
+        )
+        if has_scenes:
+            self._park_inactive_envs(env_ids)
+            reset_env_ids = env_ids
+        elif env_ids.numel() < self.num_envs:
+            all_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+            all_mask[env_ids] = False
+            inactive_env_ids = torch.nonzero(all_mask, as_tuple=False).flatten()
+            self.motion_manager.motion_ids[inactive_env_ids] = 0
+            self.motion_manager.motion_times[inactive_env_ids] = 0.0
+            reset_env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        else:
+            reset_env_ids = env_ids
 
-        obs, _ = self.env.reset(env_ids, **self._get_reset_kwargs())
+        obs, _ = self.env.reset(reset_env_ids, **self._get_reset_kwargs())
         self.agent.pre_collect_step(0)
         obs = self.agent.add_agent_info_to_obs(obs)
         obs_td = self.agent.obs_dict_to_tensordict(obs)
@@ -283,6 +322,16 @@ class MimicEvaluator(BaseEvaluator):
         actions: Tensor,
     ) -> None:
         """Record robot state and actions into trajectory buffers for this step."""
+        if not metrics:
+            return
+        first_metric = next(iter(metrics.values()))
+        if active_motion_ids.max().item() >= first_metric.num_motions:
+            keep = active_motion_ids < first_metric.num_motions
+            if not keep.any():
+                return
+            active_env_ids = active_env_ids[keep]
+            active_motion_ids = active_motion_ids[keep]
+
         if "actions" in metrics and actions is not None:
             metrics["actions"].update(
                 active_motion_ids, actions[active_env_ids].detach()
@@ -308,6 +357,7 @@ class MimicEvaluator(BaseEvaluator):
             if (
                 self.config.save_predicted_motion_lib_every is not None
                 and self.eval_count % self.config.save_predicted_motion_lib_every == 0
+                and "dof_pos" in self._metrics
             ):
                 self._save_predicted_motion_lib(
                     self._metrics, epoch=self.agent.current_epoch
