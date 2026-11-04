@@ -36,6 +36,7 @@ from protomotions.agents.utils.training import get_activation_func
 #  tau_grav_local(3), ang_momentum_local(3), subtree_mass(1),
 #  effective_inertia(1), vel_pred_error(3), s_axis(3), static_joint_params(5)]
 MINIBRAIN_FEATURE_DIM: int = 34
+MINIBRAIN_V4_FEATURE_DIM: int = 46
 
 FEAT_Q_SLICE = slice(0, 3)
 FEAT_DQ_SLICE = slice(3, 6)
@@ -49,6 +50,11 @@ FEAT_EFFECTIVE_INERTIA_SLICE = slice(22, 23)
 FEAT_VEL_PRED_ERROR_SLICE = slice(23, 26)
 FEAT_S_AXIS_SLICE = slice(26, 29)
 FEAT_STATIC_PARAMS_SLICE = slice(29, 34)
+# Mini-Brain v4 multi-step future slices (34..46)
+FEAT_DELTA_Q_STEP2_SLICE = slice(34, 37)
+FEAT_DELTA_DQ_STEP2_SLICE = slice(37, 40)
+FEAT_DELTA_Q_HORIZON_SLICE = slice(40, 43)
+FEAT_DDQ_DES_SLICE = slice(43, 46)
 
 S_AXIS_ACTIVE_EPS: float = 1e-6
 
@@ -130,15 +136,17 @@ class SharedJointMiniBrain(nn.Module):
         nn.init.zeros_(self.action_head.bias)
         self.action_head._is_zero_init_head = True
 
-        # Zero-initialized physical basis weights [4, dofs_per_joint] for:
-        #   0: (kd / kp) * dq_des          (velocity damping lead)
-        #   1: -tau_grav / (s_axis * kp)   (stamina-scaled gravity torque compensation)
-        #   2: 0.15 * L_mom / (s_axis * kp)(stamina-scaled subtree momentum compensation)
-        #   3: delta_q                     (proportional position lead)
+        # Zero-initialized physical basis weights [4 (or 5 in v4), dofs_per_joint] for:
+        #   0: (kd / kp) * dq_des                      (velocity damping lead)
+        #   1: -tau_grav / (s_axis * kp)               (stamina-scaled gravity torque compensation)
+        #   2: 0.15 * L_mom / (s_axis * kp)            (stamina-scaled subtree momentum compensation)
+        #   3: delta_q                                 (proportional position lead)
+        #   4 (v4): (I_eff * ddq_des) / (s_axis * kp)  (inertial acceleration / braking torque lead)
         # Zero at init preserves exact u_pd == q_des identity at step 0 while giving
         # fast, zero-bias physical convergence alongside the nonlinear MLP residual.
+        num_basis_terms = 5 if self.config.feature_dim >= MINIBRAIN_V4_FEATURE_DIM else 4
         self.physics_basis_weights = nn.Parameter(
-            torch.zeros(4, self.config.dofs_per_joint)
+            torch.zeros(num_basis_terms, self.config.dofs_per_joint)
         )
         self.physics_basis_weights._is_zero_init_head = True
 
@@ -208,14 +216,22 @@ class SharedJointMiniBrain(nn.Module):
         b_mom_comp = (0.15 * ang_mom) / (stamina_eff * kp)
         b_pos_lead = 0.10 * delta_q
 
-        w = self.physics_basis_weights  # [4, D]
+        w = self.physics_basis_weights  # [4 or 5, D]
         scale_inv = 1.0 / max(float(self.config.max_residual_offset), 1e-6)
-        return scale_inv * (
+        total_basis = (
             w[0] * b_vel_lead
             + w[1] * b_grav_comp
             + w[2] * b_mom_comp
             + w[3] * b_pos_lead
         )
+        if w.shape[0] >= 5 and joint_features_3d.shape[-1] >= MINIBRAIN_V4_FEATURE_DIM:
+            ddq_des = joint_features_3d[..., FEAT_DDQ_DES_SLICE] / 0.3
+            eff_inertia = (
+                joint_features_3d[..., FEAT_EFFECTIVE_INERTIA_SLICE] * 2.0
+            ).clamp_min(0.02)
+            b_accel_lead = (eff_inertia * ddq_des) / (stamina_eff * kp)
+            total_basis = total_basis + w[4] * b_accel_lead
+        return scale_inv * total_basis
 
     def freeze(self) -> "SharedJointMiniBrain":
         """Freeze all parameters and running normalization statistics."""

@@ -144,6 +144,7 @@ class MiniBrainTrainerConfig:
     checkpoint_path: str = "checkpoints/smpl_minibrain.pt"
     benchmark_json_path: str = "checkpoints/smpl_minibrain_benchmark.json"
     eval_num_envs: int = 64
+    feature_dim: int = MINIBRAIN_FEATURE_DIM
 
 
 def sample_s_axis_with_lockouts(
@@ -351,6 +352,9 @@ def sample_perturbed_smpl_reset(
 
         q_des_list: List[Tensor] = []
         dq_des_list: List[Tensor] = []
+        q_future_list: List[Tensor] = []
+        dq_future_list: List[Tensor] = []
+        future_offsets = (1, 2, 4, 8)
         for step_k in range(horizon):
             t_k = (t0 + float(step_k + 1) * dt).clamp(max=motion_lib.get_motion_length(motion_ids))
             ref_k = motion_lib.get_motion_state(motion_ids, t_k)
@@ -361,8 +365,24 @@ def sample_perturbed_smpl_reset(
             q_des_list.append(q_k)
             dq_des_list.append(dq_k)
 
+            fq_k_steps: List[Tensor] = []
+            fdq_k_steps: List[Tensor] = []
+            for f_off in future_offsets:
+                t_f = (t0 + float(step_k + f_off) * dt).clamp(max=motion_lib.get_motion_length(motion_ids))
+                ref_f = motion_lib.get_motion_state(motion_ids, t_f)
+                qf = ref_f.dof_pos.reshape(num_envs, num_joints, dofs).to(device=dev, dtype=torch.float32).clamp(lim_lo, lim_hi)
+                dqf = ref_f.dof_vel.reshape(num_envs, num_joints, dofs).to(device=dev, dtype=torch.float32)
+                qf = torch.where(active_mask > 0.5, qf, q_init)
+                dqf = dqf * active_mask
+                fq_k_steps.append(qf)
+                fdq_k_steps.append(dqf)
+            q_future_list.append(torch.stack(fq_k_steps, dim=1))
+            dq_future_list.append(torch.stack(fdq_k_steps, dim=1))
+
         q_des_seq = torch.stack(q_des_list, dim=1)
         dq_des_seq = torch.stack(dq_des_list, dim=1)
+        q_future_seq = torch.stack(q_future_list, dim=1)
+        dq_future_seq = torch.stack(dq_future_list, dim=1)
         base_root_pos = ref_0.root_pos.to(device=dev, dtype=torch.float32)
         base_root_rot = ref_0.root_rot.to(device=dev, dtype=torch.float32)
         base_root_vel = ref_0.root_vel.to(device=dev, dtype=torch.float32)
@@ -407,9 +427,12 @@ def sample_perturbed_smpl_reset(
         q_init = (q_ref_0 + eps_q * active_mask).clamp(lim_lo, lim_hi)
         dq_init = (dq_ref_0 + eps_dq) * active_mask
 
-        # Build H-step target trajectory (q_des_seq, dq_des_seq)
+        # Build H-step target trajectory (q_des_seq, dq_des_seq) and 4-point future trajectory
         q_des_list = []
         dq_des_list = []
+        q_future_list = []
+        dq_future_list = []
+        future_offsets = (1, 2, 4, 8)
         for step_k in range(horizon):
             t_k = float(step_k + 1) * dt
             phase_k = phase + freq * t_k
@@ -421,8 +444,24 @@ def sample_perturbed_smpl_reset(
             q_des_list.append(q_k)
             dq_des_list.append(dq_k)
 
+            fq_k_steps = []
+            fdq_k_steps = []
+            for f_off in future_offsets:
+                t_f = float(step_k + f_off) * dt
+                phase_f = phase + freq * t_f
+                qf = (mid + amp * torch.sin(phase_f)).clamp(lim_lo, lim_hi)
+                dqf = amp * freq * torch.cos(phase_f)
+                qf = torch.where(active_mask > 0.5, qf, q_init)
+                dqf = dqf * active_mask
+                fq_k_steps.append(qf)
+                fdq_k_steps.append(dqf)
+            q_future_list.append(torch.stack(fq_k_steps, dim=1))
+            dq_future_list.append(torch.stack(fdq_k_steps, dim=1))
+
         q_des_seq = torch.stack(q_des_list, dim=1)  # [E, H, 23, 3]
         dq_des_seq = torch.stack(dq_des_list, dim=1)  # [E, H, 23, 3]
+        q_future_seq = torch.stack(q_future_list, dim=1)  # [E, H, 4, 23, 3]
+        dq_future_seq = torch.stack(dq_future_list, dim=1)  # [E, H, 4, 23, 3]
         base_root_pos = torch.zeros((num_envs, 3), device=dev, dtype=torch.float32)
         base_root_pos[:, 2] = 0.95
         base_root_rot = quat_identity([num_envs], w_last=True).to(device=dev)
@@ -532,6 +571,8 @@ def sample_perturbed_smpl_reset(
         "root_ang_vel": root_ang_vel,
         "q_des_seq": q_des_seq,
         "dq_des_seq": dq_des_seq,
+        "q_future_seq": q_future_seq,
+        "dq_future_seq": dq_future_seq,
         "s_axis": s_axis,
         "body_stamina": body_stamina,
         "dof_active_mask": dof_active_mask,
@@ -692,8 +733,11 @@ class SyntheticSMPLPhysicsEnv:
         self,
         q_des: Tensor,
         dq_des: Tensor,
+        future_q_des: Optional[Tensor] = None,
+        future_dq_des: Optional[Tensor] = None,
+        include_future_features: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Compute analytical subtree load and `[E, 23, 34]` Mini-Brain features."""
+        """Compute analytical subtree load and `[E, 23, 34 or 46]` Mini-Brain features."""
         tau_grav_local, ang_momentum_local, subtree_mass, effective_inertia = (
             compute_analytical_subtree_load(
                 body_pos=self.body_pos,
@@ -722,6 +766,9 @@ class SyntheticSMPLPhysicsEnv:
             s_axis=self.s_axis,
             vel_pred_error=vel_pred_error,
             w_last=True,
+            future_q_des=future_q_des,
+            future_dq_des=future_dq_des,
+            include_future_features=include_future_features,
         )
         return (
             joint_features,
@@ -911,17 +958,25 @@ def collect_short_horizon_rollout(
 
     max_res = minibrain.config.max_residual_offset
 
+    use_v4_future = minibrain.config.feature_dim > MINIBRAIN_FEATURE_DIM
+
     with torch.no_grad():
         for step_k in range(cfg.horizon):
             q_t = env.q.clone()
             dq_t = env.dq.clone()
             q_des_t = reset_data["q_des_seq"][:, step_k]
             dq_des_t = reset_data["dq_des_seq"][:, step_k]
+            fq_t = reset_data["q_future_seq"][:, step_k] if "q_future_seq" in reset_data else None
+            fdq_t = reset_data["dq_future_seq"][:, step_k] if "dq_future_seq" in reset_data else None
             s_axis_t = env.s_axis.clone()
             active_mask = (s_axis_t > S_AXIS_ACTIVE_EPS).to(torch.float32)
 
             joint_features_t, tau_grav_t, _, _, _ = env.compute_load_and_features(
-                q_des=q_des_t, dq_des=dq_des_t
+                q_des=q_des_t,
+                dq_des=dq_des_t,
+                future_q_des=fq_t,
+                future_dq_des=fdq_t,
+                include_future_features=use_v4_future,
             )
 
             mb_out = minibrain(
@@ -1018,6 +1073,9 @@ def collect_short_horizon_rollout(
         final_features, _, _, _, _ = env.compute_load_and_features(
             q_des=reset_data["q_des_seq"][:, -1],
             dq_des=reset_data["dq_des_seq"][:, -1],
+            future_q_des=reset_data["q_future_seq"][:, -1] if "q_future_seq" in reset_data else None,
+            future_dq_des=reset_data["dq_future_seq"][:, -1] if "dq_future_seq" in reset_data else None,
+            include_future_features=use_v4_future,
         )
         if minibrain.value_head is not None:
             bootstrap_value = minibrain.evaluate_value(final_features).squeeze(-1)
@@ -1440,10 +1498,16 @@ def evaluate_minibrain_vs_baselines(
                 dq_t = env.dq
                 q_des_t = reset_data["q_des_seq"][:, step_k]
                 dq_des_t = reset_data["dq_des_seq"][:, step_k]
+                fq_t = reset_data["q_future_seq"][:, step_k] if "q_future_seq" in reset_data else None
+                fdq_t = reset_data["dq_future_seq"][:, step_k] if "dq_future_seq" in reset_data else None
                 s_axis_t = env.s_axis
 
                 joint_features_t, tau_grav_t, _, _, _ = env.compute_load_and_features(
-                    q_des=q_des_t, dq_des=dq_des_t
+                    q_des=q_des_t,
+                    dq_des=dq_des_t,
+                    future_q_des=fq_t,
+                    future_dq_des=fdq_t,
+                    include_future_features=(minibrain.config.feature_dim > MINIBRAIN_FEATURE_DIM),
                 )
 
                 if controller_name == "Baseline PD (u = q_des)":
@@ -1576,7 +1640,7 @@ def train_smpl_minibrain(
     mb_cfg = SharedJointMiniBrainConfig(
         num_joints=topology.num_joints,
         dofs_per_joint=3,
-        feature_dim=MINIBRAIN_FEATURE_DIM,
+        feature_dim=cfg.feature_dim,
         include_value_head=True,
         include_dynamics_head=True,
     )
@@ -1806,6 +1870,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=42,
         help="Random seed (default: 42).",
     )
+    parser.add_argument(
+        "--feature-dim",
+        type=int,
+        default=MINIBRAIN_FEATURE_DIM,
+        choices=[34, 46],
+        help="Per-joint feature dimension: 34 (v1-v3) or 46 (v4 multi-step future).",
+    )
     return parser
 
 
@@ -1828,6 +1899,7 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         benchmark_json_path=args.benchmark_json_path,
         device=args.device,
         seed=args.seed,
+        feature_dim=args.feature_dim,
     )
     _, benchmark_payload = train_smpl_minibrain(cfg)
     return benchmark_payload

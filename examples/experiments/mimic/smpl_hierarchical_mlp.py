@@ -72,6 +72,7 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace = None) -> EnvCo
     control_components = {
         "mimic": MimicControlConfig(
             bootstrap_on_episode_end=True,
+            future_steps=[1, 2, 4, 8],
         )
     }
 
@@ -84,7 +85,9 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace = None) -> EnvCo
         "collision_primitives": collision_primitives_obs_factory(),
         "stamina_obs": stamina_obs_factory(),
         "joint_load_obs": joint_load_obs_factory(robot_cfg),
-        "minibrain_features": minibrain_features_obs_factory(robot_cfg),
+        "minibrain_features": minibrain_features_obs_factory(
+            robot_cfg, include_future_features=True
+        ),
     }
 
     termination_components = {
@@ -168,8 +171,11 @@ def agent_config(
     minibrain_checkpoint = (
         getattr(args, "minibrain_checkpoint", None) if args is not None else None
     )
-    if minibrain_checkpoint is None and os.path.exists("checkpoints/smpl_minibrain.pt"):
-        minibrain_checkpoint = "checkpoints/smpl_minibrain.pt"
+    if minibrain_checkpoint is None:
+        if os.path.exists("checkpoints/smpl_minibrain_v4.pt"):
+            minibrain_checkpoint = "checkpoints/smpl_minibrain_v4.pt"
+        elif os.path.exists("checkpoints/smpl_minibrain.pt"):
+            minibrain_checkpoint = "checkpoints/smpl_minibrain.pt"
     freeze_minibrain = (
         getattr(args, "freeze_minibrain", True) if args is not None else True
     )
@@ -219,6 +225,7 @@ def agent_config(
         minibrain_config=SharedJointMiniBrainConfig(
             num_joints=num_joints,
             dofs_per_joint=3,
+            feature_dim=46,
         ),
         minibrain_checkpoint=minibrain_checkpoint,
         freeze_minibrain=freeze_minibrain,

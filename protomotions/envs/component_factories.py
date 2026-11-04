@@ -248,6 +248,7 @@ def _compute_minibrain_features_from_mimic_context(
     momentum_scale: float = 0.1,
     mass_scale: float = 0.05,
     inertia_scale: float = 0.5,
+    include_future_features: bool = False,
 ) -> torch.Tensor:
     """Top-level picklable compute kernel for `minibrain_features_obs_factory`."""
     from protomotions.envs.obs.joint_load_obs import compute_minibrain_joint_features
@@ -279,6 +280,9 @@ def _compute_minibrain_features_from_mimic_context(
         momentum_scale=momentum_scale,
         mass_scale=mass_scale,
         inertia_scale=inertia_scale,
+        future_q_des=future_dof_pos if future_dof_pos.dim() == 3 else None,
+        future_dq_des=future_dof_vel if future_dof_vel.dim() == 3 else None,
+        include_future_features=include_future_features,
     )
     return feats_3d.reshape(dof_pos.shape[0], -1)
 
@@ -291,10 +295,11 @@ def minibrain_features_obs_factory(
     momentum_scale: float = 0.1,
     mass_scale: float = 0.05,
     inertia_scale: float = 0.5,
+    include_future_features: bool = False,
 ) -> MdpComponent:
-    """Factory for the `[num_envs, num_joints, 34]` per-joint Mini-Brain feature tensor.
+    """Factory for the `[num_envs, num_joints, 34]` (or `46` in v4) per-joint Mini-Brain feature tensor.
 
-    Binds current state, next-step reference target (`EnvContext.mimic.future_dof_pos[:, 0]`),
+    Binds current state, future reference targets (`EnvContext.mimic.future_dof_pos`),
     per-body stamina (`EnvContext.body_stamina`), and static SMPL subtree topology.
     """
     from protomotions.envs.obs.joint_load_obs import build_subtree_topology
@@ -331,6 +336,7 @@ def minibrain_features_obs_factory(
             "momentum_scale": momentum_scale,
             "mass_scale": mass_scale,
             "inertia_scale": inertia_scale,
+            "include_future_features": include_future_features,
         },
     )
 

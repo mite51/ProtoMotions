@@ -77,10 +77,11 @@ def _make_synthetic_minibrain_features(
     batch_size: int = 8,
     num_joints: int = 23,
     flat: bool = True,
+    feature_dim: int = MINIBRAIN_FEATURE_DIM,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Create synthetic [E, J, 34] (or flat [E, J*34]) features along with (q_current, q_ref)."""
+    """Create synthetic [E, J, F] (or flat [E, J*F]) features along with (q_current, q_ref)."""
     torch.manual_seed(42)
-    feats = torch.randn(batch_size, num_joints, MINIBRAIN_FEATURE_DIM) * 0.1
+    feats = torch.randn(batch_size, num_joints, feature_dim) * 0.1
     q_current = torch.randn(batch_size, num_joints, 3) * 0.25
     ref_delta_q = torch.randn(batch_size, num_joints, 3) * 0.15
     q_ref = q_current + ref_delta_q
@@ -90,7 +91,7 @@ def _make_synthetic_minibrain_features(
     feats[..., FEAT_S_AXIS_SLICE] = 1.0  # All axes active
 
     if flat:
-        return feats.reshape(batch_size, num_joints * MINIBRAIN_FEATURE_DIM), q_current, q_ref
+        return feats.reshape(batch_size, num_joints * feature_dim), q_current, q_ref
     return feats, q_current, q_ref
 
 
@@ -314,12 +315,17 @@ def test_smpl_hierarchical_mlp_experiment_config_on_cpu():
     assert a_cfg.model.actor.num_out == 69
     assert a_cfg.model.actor.convert_to_normalized_action_space is True
     assert a_cfg.model.actor.residual_pose_scale == 1.8
+    assert e_cfg.control_components["mimic"].future_steps == [1, 2, 4, 8]
+    assert a_cfg.model.actor.minibrain_config.feature_dim == 46
 
     # Instantiate full PPOModel from config and run CPU forward pass
     model = PPOModel(a_cfg.model)
     batch_size = 4
     mb_feats, _, _ = _make_synthetic_minibrain_features(
-        batch_size=batch_size, num_joints=23, flat=True
+        batch_size=batch_size,
+        num_joints=23,
+        flat=True,
+        feature_dim=a_cfg.model.actor.minibrain_config.feature_dim,
     )
     td = TensorDict(
         {

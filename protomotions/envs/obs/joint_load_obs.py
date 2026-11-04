@@ -55,6 +55,8 @@ MINIBRAIN_STATIC_PARAM_DIM: int = 10
 # + vel_pred_error(3) + s_axis(3) + static_joint_params(5) = 34
 MINIBRAIN_DYNAMIC_FEATURE_DIM: int = 34
 MINIBRAIN_FEATURE_DIM: int = 34
+MINIBRAIN_V4_FUTURE_FEATURE_DIM: int = 12
+MINIBRAIN_V4_FEATURE_DIM: int = 46
 
 
 @dataclass
@@ -512,10 +514,13 @@ def compute_minibrain_joint_features(
     momentum_scale: float = 0.1,
     mass_scale: float = 0.05,
     inertia_scale: float = 0.5,
+    future_q_des: Optional[Tensor] = None,
+    future_dq_des: Optional[Tensor] = None,
+    include_future_features: bool = False,
 ) -> Tensor:
-    """Assemble the `[E, J, 34]` per-joint feature tensor for `SharedJointMiniBrain`.
+    """Assemble the `[E, J, 34]` (or `[E, J, 46]` in v4) per-joint feature tensor for `SharedJointMiniBrain`.
 
-    Feature layout per joint j (34 floats):
+    Feature layout per joint j (34 base floats + 12 optional v4 future floats):
       0..3   (3): q_j                - current joint DOF angles [x, y, z]
       3..6   (3): dq_j               - current joint DOF velocities [x, y, z]
       6..9   (3): delta_q            - wrapped angle delta atan2(sin(q_des - q_j), cos(q_des - q_j))
@@ -528,6 +533,11 @@ def compute_minibrain_joint_features(
       23..26 (3): vel_pred_error     - 1-step velocity prediction error (dq_j - dq_expected)
       26..29 (3): s_axis             - per-axis availability / stamina mask in [0, 1]
       29..34 (5): static_joint_params- [kp/1000, kd/100, effort/500, limit_span/pi, dist_to_limit_min]
+      --- Mini-Brain v4 Multi-Step Future Features (34..46) when include_future_features=True ---
+      34..37 (3): delta_q_step2      - wrapped angle delta from q_j to step-2 target q_des(t+2)
+      37..40 (3): delta_dq_step2     - scaled velocity delta (dq_des(t+2) - dq_j) * 0.1
+      40..43 (3): delta_q_horizon    - wrapped trajectory curvature q_des(t+mid) - q_des(t+1)
+      43..46 (3): ddq_des            - scaled desired angular acceleration ((dq_des(t+2) - dq_des(t+1)) / dt) * 0.01
     """
     device = dof_pos.device
     dtype = dof_pos.dtype
@@ -779,23 +789,66 @@ def compute_minibrain_joint_features(
         [kp_norm, kd_norm, effort_norm, limit_span_mean, dist_to_limit_min], dim=-1
     )
 
-    features = torch.cat(
-        [
-            q_j,  # 3
-            dq_j,  # 3
-            delta_q,  # 3
-            delta_dq,  # 3
-            gravity_dir_local,  # 3
-            tau_grav_local * torque_scale,  # 3
-            ang_momentum_local * momentum_scale,  # 3
-            subtree_mass * mass_scale,  # 1
-            effective_inertia * inertia_scale,  # 1
-            vel_err_3d,  # 3
-            s_axis_3d,  # 3
-            static_joint_params,  # 5
-        ],
-        dim=-1,
-    )
+    feature_parts = [
+        q_j,  # 3
+        dq_j,  # 3
+        delta_q,  # 3
+        delta_dq,  # 3
+        gravity_dir_local,  # 3
+        tau_grav_local * torque_scale,  # 3
+        ang_momentum_local * momentum_scale,  # 3
+        subtree_mass * mass_scale,  # 1
+        effective_inertia * inertia_scale,  # 1
+        vel_err_3d,  # 3
+        s_axis_3d,  # 3
+        static_joint_params,  # 5
+    ]
+
+    if include_future_features:
+        if future_q_des is not None and future_q_des.dim() >= 3:
+            f_steps = future_q_des.shape[1]
+            fq = future_q_des.reshape(num_envs, f_steps, num_joints, 3).to(
+                device=device, dtype=dtype
+            )
+            q_s0 = fq[:, 0]
+            q_s1 = fq[:, 1] if f_steps >= 2 else q_s0
+            q_s2 = fq[:, 2] if f_steps >= 3 else q_s1
+        else:
+            q_s0 = q_des_3d
+            q_s1 = q_des_3d
+            q_s2 = q_des_3d
+
+        if future_dq_des is not None and future_dq_des.dim() >= 3:
+            f_steps_v = future_dq_des.shape[1]
+            fdq = future_dq_des.reshape(num_envs, f_steps_v, num_joints, 3).to(
+                device=device, dtype=dtype
+            )
+            dq_s0 = fdq[:, 0]
+            dq_s1 = fdq[:, 1] if f_steps_v >= 2 else dq_s0
+        else:
+            dq_s0 = dq_des_3d
+            dq_s1 = dq_des_3d
+
+        raw_dq_step2 = q_s1 - q_j
+        delta_q_step2 = torch.atan2(torch.sin(raw_dq_step2), torch.cos(raw_dq_step2))
+        delta_dq_step2 = (dq_s1 - dq_j) * 0.1
+        raw_dq_horizon = q_s2 - q_s0
+        delta_q_horizon = torch.atan2(
+            torch.sin(raw_dq_horizon), torch.cos(raw_dq_horizon)
+        )
+        # Desired angular acceleration ((dq_s1 - dq_s0) / dt) * 0.01 = (dq_s1 - dq_s0) * 0.3
+        ddq_des = (dq_s1 - dq_s0) * 0.3
+
+        feature_parts.extend(
+            [
+                delta_q_step2,  # 3 (34..37)
+                delta_dq_step2,  # 3 (37..40)
+                delta_q_horizon,  # 3 (40..43)
+                ddq_des,  # 3 (43..46)
+            ]
+        )
+
+    features = torch.cat(feature_parts, dim=-1)
     return features
 
 

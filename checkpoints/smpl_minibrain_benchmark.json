@@ -39,9 +39,10 @@
     "edge_case_prob": 0.3,
     "motion_file": "/home/jwylie/Dev/ProtomotionsAnimData/melee_combat_bundle.pt",
     "synthetic_physics": true,
-    "checkpoint_path": "checkpoints/smpl_minibrain_melee_v3.pt",
+    "checkpoint_path": "checkpoints/smpl_minibrain_v4.pt",
     "benchmark_json_path": "checkpoints/smpl_minibrain_benchmark.json",
-    "eval_num_envs": 64
+    "eval_num_envs": 64,
+    "feature_dim": 46
   },
   "benchmark_results": {
     "nominal": {
@@ -58,10 +59,10 @@
         "horizon_vel_mse": 0.1970334555953741
       },
       "SharedJointMiniBrain": {
-        "step1_pos_mse": 0.0025372665841132402,
-        "step1_vel_mse": 0.28728336095809937,
-        "horizon_pos_mse": 0.0017568669863976538,
-        "horizon_vel_mse": 0.21356197074055672
+        "step1_pos_mse": 0.0025372363161295652,
+        "step1_vel_mse": 0.2864956557750702,
+        "horizon_pos_mse": 0.0017522059788461775,
+        "horizon_vel_mse": 0.2136160358786583
       }
     },
     "high_gravity_tilt": {
@@ -78,10 +79,10 @@
         "horizon_vel_mse": 0.200284231454134
       },
       "SharedJointMiniBrain": {
-        "step1_pos_mse": 0.0026872451417148113,
-        "step1_vel_mse": 0.3090848922729492,
-        "horizon_pos_mse": 0.0017374854360241443,
-        "horizon_vel_mse": 0.21347708441317081
+        "step1_pos_mse": 0.002684599021449685,
+        "step1_vel_mse": 0.3089945316314697,
+        "horizon_pos_mse": 0.0017321177292615175,
+        "horizon_vel_mse": 0.2132402490824461
       }
     },
     "low_stamina": {
@@ -98,10 +99,10 @@
         "horizon_vel_mse": 0.3533119857311249
       },
       "SharedJointMiniBrain": {
-        "step1_pos_mse": 0.0029540173709392548,
-        "step1_vel_mse": 0.3162631094455719,
-        "horizon_pos_mse": 0.0019005948270205408,
-        "horizon_vel_mse": 0.36866582185029984
+        "step1_pos_mse": 0.0029558928217738867,
+        "step1_vel_mse": 0.31546396017074585,
+        "horizon_pos_mse": 0.0019019996689166874,
+        "horizon_vel_mse": 0.3675370365381241
       }
     },
     "locked_1_or_2_dofs": {
@@ -118,68 +119,68 @@
         "horizon_vel_mse": 0.22628872469067574
       },
       "SharedJointMiniBrain": {
-        "step1_pos_mse": 0.002624241169542074,
-        "step1_vel_mse": 0.299517959356308,
-        "horizon_pos_mse": 0.0017866606649477035,
-        "horizon_vel_mse": 0.2583318166434765
+        "step1_pos_mse": 0.0026256628334522247,
+        "step1_vel_mse": 0.298656165599823,
+        "horizon_pos_mse": 0.0017825838003773242,
+        "horizon_vel_mse": 0.2585600055754185
       }
     }
   },
   "training_history_tail": [
     {
       "iteration": 115.0,
-      "dynamics_loss": 0.0010713638039305806,
-      "tracking_loss": 0.00031468283850699663,
-      "pred_pos_mse": 0.002035274403169751,
-      "pred_vel_mse": 0.27702054381370544,
-      "ppo_policy_loss": 0.00015999199240468442,
-      "ppo_value_loss": 0.5129730701446533,
-      "ppo_entropy": -3.8905129432678223,
-      "mean_joint_reward": 1.1348960399627686
+      "dynamics_loss": 0.0009073576657101512,
+      "tracking_loss": 0.0003095645224675536,
+      "pred_pos_mse": 0.002050172071903944,
+      "pred_vel_mse": 0.2720865309238434,
+      "ppo_policy_loss": 0.00043647445272654295,
+      "ppo_value_loss": 0.5902663469314575,
+      "ppo_entropy": -3.7713918685913086,
+      "mean_joint_reward": 1.13057541847229
     },
     {
       "iteration": 116.0,
-      "dynamics_loss": 0.0013782131718471646,
-      "tracking_loss": 0.00035652279620990157,
-      "pred_pos_mse": 0.002176018198952079,
-      "pred_vel_mse": 0.3059806227684021,
-      "ppo_policy_loss": 0.00021536066196858883,
-      "ppo_value_loss": 0.550421953201294,
-      "ppo_entropy": -3.871591329574585,
-      "mean_joint_reward": 1.129550576210022
+      "dynamics_loss": 0.0010452470742166042,
+      "tracking_loss": 0.00035253120586276054,
+      "pred_pos_mse": 0.002190705155953765,
+      "pred_vel_mse": 0.30256593227386475,
+      "ppo_policy_loss": 0.0002592310484033078,
+      "ppo_value_loss": 0.6258949041366577,
+      "ppo_entropy": -3.7524971961975098,
+      "mean_joint_reward": 1.1253658533096313
     },
     {
       "iteration": 117.0,
-      "dynamics_loss": 0.0012318618828430772,
-      "tracking_loss": 0.0003220065264031291,
-      "pred_pos_mse": 0.0020404551178216934,
-      "pred_vel_mse": 0.2850770056247711,
-      "ppo_policy_loss": 0.00025183919933624566,
-      "ppo_value_loss": 0.5006428956985474,
-      "ppo_entropy": -3.850977659225464,
-      "mean_joint_reward": 1.1352356672286987
+      "dynamics_loss": 0.0009379879920743406,
+      "tracking_loss": 0.0003168948460370302,
+      "pred_pos_mse": 0.0020583553705364466,
+      "pred_vel_mse": 0.2801012396812439,
+      "ppo_policy_loss": 9.24843789107399e-06,
+      "ppo_value_loss": 0.5480154156684875,
+      "ppo_entropy": -3.7325987815856934,
+      "mean_joint_reward": 1.130901575088501
     },
     {
       "iteration": 118.0,
-      "dynamics_loss": 0.0010948661947622895,
-      "tracking_loss": 0.000319444399792701,
-      "pred_pos_mse": 0.002000810345634818,
-      "pred_vel_mse": 0.2823934555053711,
-      "ppo_policy_loss": 0.00010847235535038635,
-      "ppo_value_loss": 0.521068811416626,
-      "ppo_entropy": -3.8497865200042725,
-      "mean_joint_reward": 1.1343846321105957
+      "dynamics_loss": 0.0008471790351904929,
+      "tracking_loss": 0.0003145787923131138,
+      "pred_pos_mse": 0.002023182110860944,
+      "pred_vel_mse": 0.27766528725624084,
+      "ppo_policy_loss": 0.0003999452164862305,
+      "ppo_value_loss": 0.5971196293830872,
+      "ppo_entropy": -3.731920003890991,
+      "mean_joint_reward": 1.1300498247146606
     },
     {
       "iteration": 119.0,
-      "dynamics_loss": 0.0012720689410343766,
-      "tracking_loss": 0.0003148621181026101,
-      "pred_pos_mse": 0.001999953994527459,
-      "pred_vel_mse": 0.2794748544692993,
-      "ppo_policy_loss": 0.0003823428996838629,
-      "ppo_value_loss": 0.5202163457870483,
-      "ppo_entropy": -3.8284852504730225,
-      "mean_joint_reward": 1.135185718536377
+      "dynamics_loss": 0.0009439348359592259,
+      "tracking_loss": 0.0003121794725302607,
+      "pred_pos_mse": 0.002018111990764737,
+      "pred_vel_mse": 0.2775314748287201,
+      "ppo_policy_loss": 0.0005932447384111583,
+      "ppo_value_loss": 0.5839905142784119,
+      "ppo_entropy": -3.712472677230835,
+      "mean_joint_reward": 1.13086998462677
     }
   ]
 }
