@@ -51,6 +51,7 @@ By default the script will call Blender automatically; pass
 ``--skip-extract --extracted-pkl path/to.pkl`` to reuse a previous extraction.
 """
 import pickle
+import re
 import shutil
 import subprocess
 import sys
@@ -149,9 +150,43 @@ RIG_PROFILE_KIMODO: RigProfile = {
 }
 
 
+# Unreal Engine mannequins (UE5 Manny/Quinn/UEFN: spine_01..05, neck_01/02;
+# UE4 mannequin: spine_01..03, neck_01). Twist/ik bones are ignored.
+_UE_LIMBS: RigProfile = {
+    "Pelvis": "pelvis",
+    "Head": "head",
+    **{
+        f"{side}_{joint}": f"{bone}_{side.lower()}"
+        for side in ("L", "R")
+        for joint, bone in (
+            ("Hip", "thigh"), ("Knee", "calf"), ("Ankle", "foot"),
+            ("Toe", "ball"), ("Thorax", "clavicle"),
+            ("Shoulder", "upperarm"), ("Elbow", "lowerarm"),
+            ("Wrist", "hand"),
+        )
+    },
+}
+RIG_PROFILE_UE5: RigProfile = {
+    **_UE_LIMBS,
+    "Torso": "spine_01",
+    "Spine": "spine_03",
+    "Chest": "spine_05",
+    "Neck": "neck_01",
+}
+RIG_PROFILE_UE4: RigProfile = {
+    **_UE_LIMBS,
+    "Torso": "spine_01",
+    "Spine": "spine_02",
+    "Chest": "spine_03",
+    "Neck": "neck_01",
+}
+
+
 RIG_PROFILES: Dict[str, RigProfile] = {
     "mixamo": RIG_PROFILE_MIXAMO,
     "kimodo": RIG_PROFILE_KIMODO,
+    "ue5_manny": RIG_PROFILE_UE5,
+    "ue4_mannequin": RIG_PROFILE_UE4,
     "biped": {
         "Pelvis": "Bip001 Pelvis",
         "Torso": "Bip001 Spine",
@@ -864,6 +899,97 @@ def _detect_scale(
     return target_hip_height_m / height_units
 
 
+# ---- A-pose rest correction ---------------------------------------------- #
+
+# (SMPL bone, SMPL child) pairs that define each limb segment's direction.
+# For L/R_Wrist the source direction uses the middle-finger root bone instead.
+_REST_FIX_SEGMENTS = [
+    (f"{s}_{a}", f"{s}_{b}")
+    for s in ("L", "R")
+    for a, b in (
+        ("Thorax", "Shoulder"), ("Shoulder", "Elbow"), ("Elbow", "Wrist"),
+        ("Wrist", "Hand"), ("Hip", "Knee"), ("Knee", "Ankle"), ("Ankle", "Toe"),
+    )
+]
+_HAND_TIP_CANDIDATES = (
+    "middle_metacarpal_{s}", "middle_01_{s}",  # Unreal
+    "{S}HandMiddle1",  # Mixamo / Kimodo
+    "Bip001 {S} Finger2",  # Biped
+)
+
+
+def _min_rotation(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Smallest rotation matrix taking unit vector ``a`` onto unit vector ``b``."""
+    v = np.cross(a, b)
+    c = float(np.dot(a, b))
+    if c < -0.999999:
+        axis = np.cross(a, [1.0, 0.0, 0.0])
+        if np.linalg.norm(axis) < 1e-6:
+            axis = np.cross(a, [0.0, 1.0, 0.0])
+        axis /= np.linalg.norm(axis)
+        return 2.0 * np.outer(axis, axis) - np.eye(3)
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + vx + vx @ vx / (1.0 + c)
+
+
+def _fix_rest_to_smpl_tpose(
+    source_data: dict,
+    resolved_mapping: RigProfile,
+    R_align: np.ndarray,
+    smpl_body_names,
+    smpl_rest_pos: np.ndarray,
+) -> None:
+    """Adjust source rest rotations so a non-T-pose bind (e.g. the A-pose of
+    Unreal Manny) is treated as its true pose rather than as SMPL's T-pose.
+
+    For every limb segment we find the minimal rotation ``D`` (MJCF frame)
+    taking the SMPL rest bone direction onto the source rest bone direction,
+    then set ``rest' = R_align^T D^T R_align rest``. With the retarget formula
+    this makes the source bind pose map to an SMPL pose whose limbs point the
+    same way as the source's, instead of to an SMPL T-pose.
+    """
+    names = source_data["bone_names"]
+    n2i = {n: i for i, n in enumerate(names)}
+    smpl_i = {n: i for i, n in enumerate(smpl_body_names)}
+    P = source_data["rest_world_pos"]
+    R = source_data["rest_world_rot"].copy()
+    fixed = []
+    for parent, child in _REST_FIX_SEGMENTS:
+        src_parent = resolved_mapping.get(parent)
+        if src_parent is None or src_parent not in n2i:
+            continue
+        if parent.endswith("_Wrist"):
+            side = parent[0]
+            src_child = None
+            for pat in _HAND_TIP_CANDIDATES:
+                cand = pat.format(s=side.lower(), S="Left" if side == "L" else "Right")
+                for prefix in MIXAMO_PREFIX_VARIANTS:
+                    if prefix + cand in n2i:
+                        src_child = prefix + cand
+                        break
+                if src_child:
+                    break
+        else:
+            src_child = resolved_mapping.get(child)
+        if src_child is None or src_child not in n2i:
+            continue
+        d_s = R_align @ (P[n2i[src_child]] - P[n2i[src_parent]])
+        d_t = smpl_rest_pos[smpl_i[child]] - smpl_rest_pos[smpl_i[parent]]
+        if np.linalg.norm(d_s) < 1e-8 or np.linalg.norm(d_t) < 1e-8:
+            continue
+        d_s, d_t = d_s / np.linalg.norm(d_s), d_t / np.linalg.norm(d_t)
+        D = _min_rotation(d_t, d_s)
+        j = n2i[src_parent]
+        R[j] = R_align.T @ D.T @ R_align @ _ortho_normalize(R[j])
+        ang = np.degrees(np.arccos(np.clip(np.dot(d_s, d_t), -1.0, 1.0)))
+        fixed.append(f"{parent}={ang:.0f}deg")
+    source_data["rest_world_rot"] = R
+    print(f"Rest-pose fix applied to {len(fixed)} segments: {', '.join(fixed)}")
+
+
+_GENERIC_TAKE_RE = re.compile(r"^(unreal take|take[ _]?\d*|mixamo\.com|default take)$", re.I)
+
+
 # ---- CLI ------------------------------------------------------------------ #
 
 
@@ -959,6 +1085,14 @@ def main(
             "is treated as 'no motion' for trimming."
         ),
     ),
+    fix_rest_pose: bool = typer.Option(
+        False, "--fix-rest-pose",
+        help=(
+            "Treat the source rest/bind pose as a real pose (e.g. Unreal Manny's "
+            "A-pose) instead of assuming it matches SMPL's T-pose. Corrects "
+            "raised arms when the bind pose is not a T-pose."
+        ),
+    ),
     trim_pad_frames: int = typer.Option(
         1,
         help=(
@@ -1052,6 +1186,12 @@ def main(
         for act in source_data["actions"].values():
             act["world_pos"] = act["world_pos"] * float(scale)
 
+    if fix_rest_pose:
+        _fix_rest_to_smpl_tpose(
+            source_data, resolved_mapping, R_align, smpl_body_names,
+            smpl_rest_pos.cpu().numpy(),
+        )
+
     src_idx, _ = _build_source_index_map(
         smpl_body_names,
         source_data["bone_names"],
@@ -1070,10 +1210,13 @@ def main(
         print(f"Filtered to {len(keys)} actions matching '{only_action}'")
 
     for name in keys:
-        print(f"\n[Action] {name}")
+        out_name = name
+        if len(actions) == 1 and _GENERIC_TAKE_RE.match(name.strip()):
+            out_name = fbx_path.stem
+        print(f"\n[Action] {name}" + (f" -> {out_name}" if out_name != name else ""))
         try:
             _process_action(
-                name=name,
+                name=out_name,
                 action=actions[name],
                 source_data=source_data,
                 R_align=R_align,
