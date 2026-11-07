@@ -39,6 +39,11 @@ Usage::
         c:/path/to/KB_Movement.fbx \
         --output-dir data/yaml_files/FightingAnimsetPro/
 
+Add ``--baked-output-dir c:/path/to/Unity/Assets/BakedAnimations/KB_Movement``
+to write Unity JSON for every action from the same motion state. To export
+existing motions, use ``data/scripts/convert_motion.py motion-to-baked INPUT OUTPUT``;
+both file and directory inputs are supported. Velocities are preserved verbatim.
+
 Orientation is unchanged by default. Pass ``--auto-correct`` (also accepted as
 ``--auto_correct``) to align the first retained pelvis to forward +X and up +Z.
 This assumes that frame should be upright and forward-facing. For explicit
@@ -82,6 +87,15 @@ from protomotions.components.pose_lib import (  # noqa: E402
 
 
 app = typer.Typer(pretty_exceptions_enable=False)
+
+
+class _ExtractionUnpickler(pickle.Unpickler):
+    """Read Blender's NumPy 2 extraction in NumPy 1 training environments too."""
+
+    def find_class(self, module, name):
+        if np.__version__.split('.')[0] == '1' and module.startswith('numpy._core'):
+            module = module.replace('numpy._core', 'numpy.core', 1)
+        return super().find_class(module, name)
 
 
 # ---- Bone mapping --------------------------------------------------------- #
@@ -607,6 +621,7 @@ def _process_action(
     trim_pad_frames: int = 1,
     auto_correct: bool = False,
     rotation_euler: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    baked_output_dir: Optional[Path] = None,
 ):
     src_world_rot = _ortho_normalize_batch(action["world_rot"])  # strip Blender scale
     src_world_pos = action["world_pos"]  # (T, J, 3)
@@ -728,6 +743,11 @@ def _process_action(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"  -> {out_path}  T={motion.rigid_body_pos.shape[0]} fps={current_fps}")
     torch.save(motion.to_dict(), str(out_path))
+    if baked_output_dir is not None:
+        from protomotions.utils.baked_animation import motion_to_baked, write_baked
+        baked_path = baked_output_dir / f"{name}_baked.json"
+        write_baked(motion_to_baked(motion, name), baked_path)
+        print(f"  -> {baked_path}")
 
 
 def _ensure_extracted_pkl(
@@ -875,6 +895,9 @@ def main(
         help="Where to write per-action .motion files.",
     ),
     output_fps: int = typer.Option(30, help="Target output FPS for .motion files."),
+    baked_output_dir: Optional[Path] = typer.Option(
+        None, help="Also export each action as Unity baked JSON, preserving its motion state.",
+    ),
     auto_correct: bool = typer.Option(
         False, "--auto-correct", "--auto_correct",
         help="Rotate the whole clip so the first retained pelvis faces +X with +Z up. Assumes that frame is upright and forward-facing; corrects pitch, roll and yaw.",
@@ -983,7 +1006,7 @@ def main(
     _ensure_extracted_pkl(fbx_path, extracted_pkl, blender_exe, rest_action)
 
     with open(extracted_pkl, "rb") as f:
-        source_data = pickle.load(f)
+        source_data = _ExtractionUnpickler(f).load()
 
     print(
         f"Loaded {len(source_data['actions'])} actions, "
@@ -998,7 +1021,7 @@ def main(
         rest_pkl = extracted_pkl.parent / (rest_fbx.stem + "__rest.pkl")
         _ensure_rest_pkl(rest_fbx, rest_pkl, blender_exe)
         with open(rest_pkl, "rb") as f:
-            rest_data = pickle.load(f)
+            rest_data = _ExtractionUnpickler(f).load()
         _replace_rest_pose(source_data, rest_data)
 
     device = torch.device("cpu")
@@ -1069,6 +1092,7 @@ def main(
         keys = [k for k in keys if only_action in k]
         print(f"Filtered to {len(keys)} actions matching '{only_action}'")
 
+    failures = []
     for name in keys:
         print(f"\n[Action] {name}")
         try:
@@ -1093,12 +1117,16 @@ def main(
                 trim_pad_frames=trim_pad_frames,
                 auto_correct=auto_correct,
                 rotation_euler=rotation_euler,
+                baked_output_dir=baked_output_dir,
             )
         except Exception as e:  # noqa: BLE001
             import traceback
 
             print(f"  [error] failed to process {name}: {e}")
             traceback.print_exc()
+            failures.append(name)
+    if failures:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":
