@@ -966,11 +966,25 @@ class IsaacLabSimulator(Simulator):
             for body_idx, body_name in enumerate(sim_body_names):
                 if body_name in sensor_map:
                     contact_sensor = sensor_map[body_name]
-                    # net_forces_w has shape [E, 1, 3]; includes inter-character
-                    # contacts regardless of the sensor filter list.
-                    forces[:, body_idx, :] = wp.to_torch(contact_sensor.data.net_forces_w).clone()[
-                        :, 0, :
-                    ]
+                    raw_force_matrix = contact_sensor.data.force_matrix_w
+                    if raw_force_matrix is not None:
+                        # force_matrix_w has shape [E, 1, num_filter_shapes, 3];
+                        # sum over filtered environment prims (ground + scene objects)
+                        # so self-collisions between the robot's own bodies are excluded.
+                        force_matrix = (
+                            raw_force_matrix
+                            if isinstance(raw_force_matrix, torch.Tensor)
+                            else wp.to_torch(raw_force_matrix)
+                        ).clone()
+                        forces[:, body_idx, :] = force_matrix.view(E, -1, 3).sum(dim=1)
+                    else:
+                        raw_net_forces = contact_sensor.data.net_forces_w
+                        net_forces = (
+                            raw_net_forces
+                            if isinstance(raw_net_forces, torch.Tensor)
+                            else wp.to_torch(raw_net_forces)
+                        ).clone()
+                        forces[:, body_idx, :] = net_forces[:, 0, :]
             per_robot_forces.append(forces)
         rigid_body_contact_forces = self._stack_robots(per_robot_forces)
 

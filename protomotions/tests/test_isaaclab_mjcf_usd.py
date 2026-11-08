@@ -846,3 +846,72 @@ def test_public_install_metadata_targets_isaaclab3_stack():
     assert 'requires-python = "==3.11.*"' not in dependency_section
     assert '"torch==2.7.0"' not in dependency_section
     assert "pytorch-cu128" not in dependency_section
+
+
+def test_simulator_bodies_contact_buf_uses_filtered_force_matrix_to_exclude_self_collisions():
+    from types import SimpleNamespace
+
+    import torch
+
+    try:
+        from protomotions.simulator.isaaclab.simulator import IsaacLabSimulator
+    except ImportError as exc:
+        pytest.skip(f"IsaacLab runtime is unavailable: {exc}")
+
+    num_envs = 2
+    # L_Ankle has self-collision in net_forces_w (100 N) but 0 N against ground/objects in force_matrix_w;
+    # R_Ankle has ground + object contact in force_matrix_w ([0, 0, 40] + [0, 0, 15]);
+    # L_Hand has force_matrix_w=None and falls back to net_forces_w.
+    l_ankle_sensor = SimpleNamespace(
+        data=SimpleNamespace(
+            force_matrix_w=torch.zeros(num_envs, 1, 2, 3),
+            net_forces_w=torch.tensor([[[50.0, -80.0, 0.0]], [[30.0, -60.0, 0.0]]]),
+        )
+    )
+    r_ankle_fm = torch.zeros(num_envs, 1, 2, 3)
+    r_ankle_fm[:, 0, 0, 2] = 40.0
+    r_ankle_fm[:, 0, 1, 2] = 15.0
+    r_ankle_sensor = SimpleNamespace(
+        data=SimpleNamespace(
+            force_matrix_w=r_ankle_fm,
+            net_forces_w=torch.full((num_envs, 1, 3), 999.0),
+        )
+    )
+    l_hand_sensor = SimpleNamespace(
+        data=SimpleNamespace(
+            force_matrix_w=None,
+            net_forces_w=torch.tensor([[[1.0, 2.0, 3.0]], [[4.0, 5.0, 6.0]]]),
+        )
+    )
+
+    simulator = object.__new__(IsaacLabSimulator)
+    simulator.device = torch.device("cpu")
+    simulator.num_physical_envs = num_envs
+    simulator.num_characters = 1
+    simulator.num_envs = num_envs
+    simulator._robot = SimpleNamespace(
+        body_names=["Pelvis", "L_Ankle", "R_Ankle", "L_Hand"]
+    )
+    simulator._contact_sensor_maps = [
+        {
+            "L_Ankle": l_ankle_sensor,
+            "R_Ankle": r_ankle_sensor,
+            "L_Hand": l_hand_sensor,
+        }
+    ]
+
+    state = simulator._get_simulator_bodies_contact_buf()
+    forces = state.rigid_body_contact_forces
+
+    assert forces.shape == (num_envs, 4, 3)
+    # L_Ankle self-collision in net_forces_w is ignored in favor of filtered force_matrix_w (all zeros)
+    torch.testing.assert_close(forces[:, 1, :], torch.zeros(num_envs, 3))
+    # R_Ankle sums over the 2 filtered environment prims (40 + 15 = 55 N in Z)
+    torch.testing.assert_close(
+        forces[:, 2, :], torch.tensor([[0.0, 0.0, 55.0], [0.0, 0.0, 55.0]])
+    )
+    # L_Hand falls back to net_forces_w when force_matrix_w is None
+    torch.testing.assert_close(
+        forces[:, 3, :], torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    )
+

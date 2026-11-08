@@ -258,10 +258,9 @@ class SceneCfg(InteractiveSceneCfg):
                 for obj_idx in range(num_objects_per_scene):
                     sensing_filter.append(f"/World/envs/env_.*/Object_{obj_idx}")
                 # Body prim root for this character: substitute the robot name into
-                # the configured "/Robot/" path. Inter-character contact forces are
-                # captured by net_forces_w regardless of the filter list, so we do
-                # not add other characters to the filter (opponent-impact reward is
-                # computed geometrically, not via contact-object resolution).
+                # the configured "/Robot/" path. Filtering against terrain + scene
+                # objects populates force_matrix_w so self-collisions between a
+                # character's own bodies are excluded from contact sensing.
                 for body_name in robot_config.contact_bodies:
                     contact_sensor_cfg = ContactSensorCfg(
                         prim_path=contact_sensor_prim_path(body_name, body_prim_paths).replace("/Robot/", f"/{robot_name}/"),
