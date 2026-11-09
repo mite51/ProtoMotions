@@ -231,7 +231,14 @@ def convert_amass_to_motion(
     # because we know all joints are 3 dof exp_map joints...
     motion.dof_vel = local_angular_vels.reshape(-1, n_j * 3)
 
-    motion.fix_height(height_offset=foot_offsets_dict[humanoid_type])
+    if humanoid_type == "smpl":
+        from data.scripts.retarget_fbx_to_smpl import _apply_height_anchor
+
+        _apply_height_anchor(
+            motion, mode="global", foot_offset=foot_offsets_dict[humanoid_type]
+        )
+    else:
+        motion.fix_height(height_offset=foot_offsets_dict[humanoid_type])
 
     # compute contacts using position and velocity thresholds
     motion.rigid_body_contacts = compute_contact_labels_from_pos_and_vel(

@@ -486,36 +486,208 @@ def _trim_static_frames(
 # That makes the standing feet end up several centimetres above the floor
 # after the global shift.
 HEIGHT_MODES = ("global", "last_frame", "first_frame", "per_frame", "disable")
+DEFAULT_GEOM_CLEARANCE: float = 0.002
 
 
-def _apply_height_anchor(motion, mode: str, foot_offset: float) -> None:
-    """In-place vertical anchoring of ``motion`` according to ``mode``.
+def parse_mjcf_collision_geoms(mjcf_path: Optional[str] = None) -> list:
+    """Parse per-body collision geometry (box or capsule) in MJCF body-traversal order."""
+    import xml.etree.ElementTree as ET
 
-    Modes:
-      * ``global``: classic ``fix_height`` — global min lands at ``foot_offset``.
-      * ``last_frame`` / ``first_frame``: anchor to one frame's lowest body.
-        Ideal for getup/laydown clips that end (or start) in stable standing.
-      * ``per_frame``: each frame's lowest body lands at ``foot_offset`` (only
-        lifts frames below ground, drops by at most 0.02 m).
-      * ``disable``: leave the FK output untouched.
-    """
+    if mjcf_path is None:
+        default_xml = _PROJECT_ROOT / "protomotions" / "data" / "assets" / "mjcf" / "smpl_humanoid.xml"
+        if not default_xml.is_file():
+            return []
+        mjcf_path = str(default_xml)
+    elif not Path(mjcf_path).is_file():
+        candidate = _PROJECT_ROOT / mjcf_path
+        if candidate.is_file():
+            mjcf_path = str(candidate)
+        else:
+            return []
+
+    tree = ET.parse(mjcf_path)
+    worldbody = tree.getroot().find("worldbody")
+    if worldbody is None:
+        return []
+
+    geoms = []
+    for body_elem in worldbody.iter("body"):
+        g = body_elem.find("geom")
+        if g is None:
+            geoms.append(("sphere", np.zeros(3, dtype=np.float32), 0.0))
+            continue
+        gtype = g.get("type", "box")
+        if gtype == "box":
+            pos = np.fromstring(g.get("pos", "0 0 0"), sep=" ").astype(np.float32)
+            size = np.fromstring(g.get("size", "0 0 0"), sep=" ").astype(np.float32)
+            geoms.append(("box", pos, size))
+        else:
+            ft = np.fromstring(g.get("fromto", "0 0 0 0 0 0"), sep=" ").reshape(2, 3).astype(np.float32)
+            rad = float(np.fromstring(g.get("size", "0.0"), sep=" ")[0])
+            geoms.append(("capsule", ft, rad))
+    return geoms
+
+
+def compute_collision_min_z(
+    body_pos: torch.Tensor,
+    body_rot: torch.Tensor,
+    collision_geoms: Optional[list] = None,
+    w_last: bool = True,
+) -> torch.Tensor:
+    """Compute exact lowest world Z [T, B] of each body's collision geom."""
+    from protomotions.utils.rotations import quaternion_to_matrix
+
+    if collision_geoms is None:
+        collision_geoms = parse_mjcf_collision_geoms()
+    T, B, _ = body_pos.shape
+    if not collision_geoms or len(collision_geoms) != B:
+        return body_pos[..., 2]
+
+    if body_rot.dim() == 4 and body_rot.shape[-2:] == (3, 3):
+        R = body_rot
+    else:
+        R = quaternion_to_matrix(body_rot, w_last=w_last)
+
+    min_z = torch.empty((T, B), dtype=body_pos.dtype, device=body_pos.device)
+    for b, (gtype, p1, p2) in enumerate(collision_geoms):
+        Rb = R[:, b]  # (T, 3, 3)
+        pb = body_pos[:, b]  # (T, 3)
+        if gtype == "box":
+            pos_t = torch.as_tensor(p1, dtype=body_pos.dtype, device=body_pos.device)
+            size_t = torch.as_tensor(p2, dtype=body_pos.dtype, device=body_pos.device)
+            c_z = pb[:, 2] + (Rb[:, 2, :] * pos_t).sum(dim=-1)
+            extent_z = (Rb[:, 2, :].abs() * size_t).sum(dim=-1)
+            min_z[:, b] = c_z - extent_z
+        elif gtype == "capsule":
+            ft_t = torch.as_tensor(p1, dtype=body_pos.dtype, device=body_pos.device)  # (2, 3)
+            rad = float(p2)
+            end_z = pb[:, 2:3] + torch.matmul(Rb[:, 2:3, :], ft_t.T).squeeze(1)  # (T, 2)
+            min_z[:, b] = end_z.min(dim=-1).values - rad
+        else:
+            min_z[:, b] = pb[:, 2]
+    return min_z
+
+
+def _smooth_nonnegative_lift(raw_lift: torch.Tensor, sigma: float = 2.5) -> torch.Tensor:
+    """Smooth a non-negative per-frame vertical lift curve while preserving clearance."""
+    if raw_lift.numel() <= 1 or float(raw_lift.max().item()) <= 0.0:
+        return raw_lift
+    radius = max(1, int(round(3.0 * sigma)))
+    offsets = torch.arange(-radius, radius + 1, device=raw_lift.device, dtype=raw_lift.dtype)
+    kernel = torch.exp(-0.5 * (offsets / sigma) ** 2)
+    kernel = (kernel / kernel.sum()).view(1, 1, -1)
+
+    def _conv1d_replicate(x: torch.Tensor) -> torch.Tensor:
+        x_3d = x.view(1, 1, -1)
+        x_pad = torch.nn.functional.pad(x_3d, (radius, radius), mode="replicate")
+        return torch.nn.functional.conv1d(x_pad, kernel).view(-1)
+
+    smoothed = _conv1d_replicate(raw_lift)
+    envelope = torch.maximum(smoothed, raw_lift)
+    return torch.maximum(_conv1d_replicate(envelope), raw_lift)
+
+
+def _compute_height_anchor_lift(
+    body_pos: torch.Tensor,
+    body_rot: torch.Tensor,
+    mode: str,
+    foot_offset: float,
+    collision_geoms: Optional[list] = None,
+    geom_clearance: float = DEFAULT_GEOM_CLEARANCE,
+) -> torch.Tensor:
+    """Return per-frame vertical Z shift [T] for ``mode`` that also prevents collision-geom penetration."""
+    T = body_pos.shape[0]
+    device = body_pos.device
+    dtype = body_pos.dtype
     if mode == "disable":
-        return
+        return torch.zeros(T, device=device, dtype=dtype)
+
+    if collision_geoms is None:
+        collision_geoms = parse_mjcf_collision_geoms()
+    geom_min_z = compute_collision_min_z(body_pos, body_rot, collision_geoms).min(dim=1).values  # [T]
+    joint_min_z = body_pos[:, :, 2].min(dim=1).values  # [T]
+
     if mode == "global":
-        motion.fix_height(height_offset=foot_offset)
-        return
+        req_joint = torch.clamp(foot_offset - joint_min_z, min=0.0)
+        req_geom = torch.clamp(geom_clearance - geom_min_z, min=0.0)
+        req_all = torch.maximum(req_joint, req_geom)
+        grounded = (joint_min_z - joint_min_z.min()) < 0.03
+        if grounded.any():
+            base_shift = float(
+                min(
+                    req_all[0].item(),
+                    req_all[-1].item(),
+                    torch.quantile(req_all[grounded], 0.15).item(),
+                )
+            )
+        else:
+            base_shift = float(req_all.min().item())
+        residual = torch.clamp(req_all - base_shift, min=0.0)
+        return base_shift + _smooth_nonnegative_lift(residual)
+
     if mode == "per_frame":
-        motion.fix_height_per_frame(height_offset=foot_offset)
-        return
+        req_joint = foot_offset - joint_min_z
+        req_geom = geom_clearance - geom_min_z
+        raw_lift = torch.clamp(torch.maximum(req_joint, req_geom), min=0.0)
+        return _smooth_nonnegative_lift(raw_lift)
+
     if mode in {"last_frame", "first_frame"}:
         idx = -1 if mode == "last_frame" else 0
-        ref_min = motion.rigid_body_pos[idx, :, 2].min().item()
-        shift_z = float(-ref_min + foot_offset)
-        shift_vec = torch.zeros(3, device=motion.rigid_body_pos.device)
-        shift_vec[2] = shift_z
-        motion.translate(shift_vec)
-        return
+        shift_joint = float(-joint_min_z[idx].item() + foot_offset)
+        shift_geom = float(-geom_min_z[idx].item() + geom_clearance)
+        base_shift = max(shift_joint, shift_geom)
+        # After anchoring the reference standing frame, smoothly lift any frame whose
+        # collision geometry or joints still penetrate below the ground plane (e.g.
+        # lying/getup phases where source-vs-SMPL limb/torso proportions differ).
+        residual_geom_penetration = geom_clearance - (geom_min_z + base_shift)
+        residual_joint_penetration = foot_offset - (joint_min_z + base_shift)
+        raw_extra_lift = torch.clamp(
+            torch.maximum(residual_geom_penetration, residual_joint_penetration),
+            min=0.0,
+        )
+        smooth_extra_lift = _smooth_nonnegative_lift(raw_extra_lift)
+        return base_shift + smooth_extra_lift
+
     raise ValueError(f"Unknown height_mode '{mode}'. Choose one of {HEIGHT_MODES}.")
+
+
+def _apply_height_anchor(
+    motion,
+    mode: str,
+    foot_offset: float,
+    collision_geoms: Optional[list] = None,
+    geom_clearance: float = DEFAULT_GEOM_CLEARANCE,
+) -> torch.Tensor:
+    """In-place vertical anchoring of ``motion`` (positions and velocities) according to ``mode``.
+
+    Returns the per-frame vertical shift ``lift_z`` of shape ``[T]`` applied to ``motion``.
+    """
+    lift_z = _compute_height_anchor_lift(
+        body_pos=motion.rigid_body_pos,
+        body_rot=motion.rigid_body_rot,
+        mode=mode,
+        foot_offset=foot_offset,
+        collision_geoms=collision_geoms,
+        geom_clearance=geom_clearance,
+    )
+    if float(lift_z.abs().max().item()) == 0.0:
+        return lift_z
+
+    translation_vecs = torch.zeros(
+        (lift_z.shape[0], 3),
+        device=motion.rigid_body_pos.device,
+        dtype=motion.rigid_body_pos.dtype,
+    )
+    translation_vecs[:, 2] = lift_z
+    motion.translate(translation_vecs)
+
+    # Keep vertical linear velocities consistent with time-varying per-frame lifts.
+    if getattr(motion, "rigid_body_vel", None) is not None and lift_z.shape[0] >= 2:
+        dt = float(getattr(motion, "motion_dt", 1.0 / max(float(getattr(motion, "fps", 30.0)), 1.0)))
+        if dt > 0.0 and float((lift_z - lift_z[0]).abs().max().item()) > 1e-6:
+            dz_dt = torch.gradient(lift_z, spacing=dt)[0]
+            motion.rigid_body_vel[:, :, 2] = motion.rigid_body_vel[:, :, 2] + dz_dt.unsqueeze(1)
+    return lift_z
 
 
 # ---- Retargeting core ----------------------------------------------------- #
@@ -737,6 +909,19 @@ def _process_action(
         smpl_local[:, 0] = correction_t @ smpl_local[:, 0]
         print(f"  orientation: auto_correct={auto_correct}, Euler XYZ={rotation_euler} degrees")
 
+    if height_mode != "disable":
+        fk_pos_pre, fk_rot_pre = compute_forward_kinematics_from_transforms(
+            kinematic_info, root_pos, smpl_local
+        )
+        lift_z = _compute_height_anchor_lift(
+            body_pos=fk_pos_pre,
+            body_rot=fk_rot_pre,
+            mode=height_mode,
+            foot_offset=foot_offset,
+        )
+        root_pos = root_pos.clone()
+        root_pos[:, 2] = root_pos[:, 2] + lift_z
+
     motion = fk_from_transforms_with_velocities(
         kinematic_info=kinematic_info,
         root_pos=root_pos,
@@ -764,8 +949,6 @@ def _process_action(
         fps=current_fps,
     )
     motion.dof_vel = local_angular_vels.reshape(-1, n_j * 3)
-
-    _apply_height_anchor(motion, height_mode, foot_offset)
 
     motion.rigid_body_contacts = compute_contact_labels_from_pos_and_vel(
         positions=motion.rigid_body_pos,
